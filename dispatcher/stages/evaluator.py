@@ -245,7 +245,8 @@ class Evaluator:
         messages = self._build_messages(envelope, images)
 
         raw, result, meta = await self._call_with_escalation(
-            messages, tier=tier, configured_tier=configured_tier, meta=meta, budget=budget
+            messages, envelope=envelope, tier=tier, configured_tier=configured_tier,
+            meta=meta, budget=budget
         )
         meta.model_resolved = result.model_resolved
         meta.latency_ms = result.latency_ms
@@ -265,6 +266,7 @@ class Evaluator:
         self,
         messages: list[LLMMessage],
         *,
+        envelope: TaskEnvelope,
         tier: str,
         configured_tier: str,
         meta: EvaluationMeta,
@@ -337,7 +339,13 @@ class Evaluator:
         # 全部尝试失败 → 兜底画像，degraded=true，任务继续（见 docs/02-stages.md 失败模式表）
         meta.degraded = True
         meta.notes.append(f"评估器全部尝试失败，使用兜底画像：{last}")
-        return self._fallback_raw(), _DegradedResult(tier=configured_tier), meta
+        raw = self._fallback_raw(envelope)
+        if raw["task_type"] != self._taxonomy.fallback_type:
+            meta.notes.append(
+                f"兜底画像沿用调用方声明的类型 {raw['task_type']}"
+                f"（declared.authoritative=true），未落到 {self._taxonomy.fallback_type}"
+            )
+        return raw, _DegradedResult(tier=configured_tier), meta
 
     @staticmethod
     def _vision_required_for(messages: list[LLMMessage]) -> bool:
@@ -347,18 +355,67 @@ class Evaluator:
             for m in messages
         )
 
-    def _fallback_raw(self) -> dict:
+    def _fallback_raw(self, envelope: TaskEnvelope) -> dict:
+        """评估失败时的兜底画像。
+
+        **调用方的权威声明不能在这里丢掉。** ``declared.authoritative: true`` 是
+        契约里唯一的合法快捷路径（``schemas/task_envelope.json``）：调用方在做结构化
+        断言"我已经知道这是什么"。而评估器失败恰恰是最需要这条信息的时刻——之前无条件
+        返回 ``generic.unknown``，于是"带图记账 + 已声明意图"在评估器抖动一次之后就变成
+        一份内容为空的画像：能力候选为空 → 流程模板匹配不上 → 自由拆解拿着空画像拆 →
+        产出空计划 → 整单 422（P0-1c）。声明本来就在手里，没有理由丢掉。
+
+        只认**词表里有的**声明：声明是断言，不是特权。越出封闭词表的声明等于没有声明
+        （词表封闭是刻意的，见 ``core/taxonomy.py``）。
+        """
+        declared_type: str | None = None
+        if envelope.declared.authoritative and envelope.declared.intent:
+            if envelope.declared.intent in self._taxonomy.ids:
+                declared_type = envelope.declared.intent
+
+        if declared_type is None:
+            return {
+                "task_type": self._taxonomy.fallback_type,
+                "intent_summary": "评估器未能完成，使用兜底画像。",
+                "complexity": {"score": 0.0, "reasons": ["评估器降级"]},
+                "urgency": {"level": "normal"},
+                "required_capabilities": [],
+                "candidate_capabilities": [],
+                "recommended_mode": "async",
+                "needs_clarification": False,
+                "confidence": 0.0,
+            }
+
+        t = self._taxonomy.get(declared_type)
         return {
-            "task_type": self._taxonomy.fallback_type,
-            "intent_summary": "评估器未能完成，使用兜底画像。",
-            "complexity": {"score": 0.0, "reasons": ["评估器降级"]},
+            "task_type": declared_type,
+            "intent_summary": f"评估器未能完成，沿用调用方声明的类型：{declared_type}",
+            "complexity": {"score": 0.0, "reasons": ["评估器降级，沿用调用方声明"]},
             "urgency": {"level": "normal"},
             "required_capabilities": [],
-            "candidate_capabilities": [],
+            "candidate_capabilities": self._capabilities_for(declared_type, envelope),
             "recommended_mode": "async",
             "needs_clarification": False,
             "confidence": 0.0,
+            "data_sensitivity": t.sensitivity if t else None,
         }
+
+    def _capabilities_for(self, type_id: str, envelope: TaskEnvelope) -> list[str]:
+        """从声明推出候选能力——**纯集合读取，降级路径上不再引入一次抽样**。
+
+        能力清单来自 handler 自己的声明：词表的 ``domain`` 按命名约定就是
+        ``handler_id``（见 ``config/taxonomy.yaml``）。调用方若还显式声明了
+        ``capability`` 且它确实存在，就把它放在最前面。
+        """
+        caps: list[str] = []
+        declared_cap = envelope.declared.capability
+        if declared_cap and declared_cap in self._registry.all_capabilities():
+            caps.append(declared_cap)
+        domain = self._taxonomy.domain_of(type_id)
+        m = self._registry.manifest(domain) if domain else None
+        if m is not None:
+            caps.extend(c for c in m.capabilities if c not in caps)
+        return caps
 
     # ------------------------------------------------------------------
     def _build_profile(

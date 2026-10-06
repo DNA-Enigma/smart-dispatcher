@@ -59,13 +59,33 @@ class ScriptedLLM:
 
     ``responses`` 里的元素可以是 dict（会被 json.dumps）或 str（原样返回，
     用于测试"模型吐了非 JSON"的路径）。
+
+    ``fail_first_n`` 让**前 N 次调用**失败、之后恢复正常。用来构造"评估器那一次
+    挂了、后面几步还好"的场景（P0-1c 正是这样：降级发生在 01，任务却要继续走完
+    02/03）。不传（``None``）时保持原语义——只要给了 ``fail_with`` 就每次都失败。
     """
 
-    def __init__(self, responses: list[Any], *, fail_with: Exception | None = None) -> None:
+    def __init__(
+        self,
+        responses: list[Any],
+        *,
+        fail_with: Exception | None = None,
+        fail_first_n: int | None = None,
+    ) -> None:
         self._responses = list(responses)
         self._fail_with = fail_with
+        self._fail_first_n = fail_first_n
+        self._n_calls = 0
         self.calls: list[RecordedCall] = []
         self.tiers_used: list[str] = []
+
+    def _maybe_fail(self) -> None:
+        """记录调用次数，并在前 ``fail_first_n`` 次内抛出预置错误。"""
+        self._n_calls += 1
+        if self._fail_with is None:
+            return
+        if self._fail_first_n is None or self._n_calls <= self._fail_first_n:
+            raise self._fail_with
 
     async def complete(
         self,
@@ -86,8 +106,7 @@ class ScriptedLLM:
             )
         )
         self.tiers_used.append(tier)
-        if self._fail_with is not None:
-            raise self._fail_with
+        self._maybe_fail()
         if not self._responses:
             raise LLMError("ScriptedLLM 没有更多预置响应了", retryable=False)
         item = self._responses.pop(0)
@@ -115,8 +134,7 @@ class ScriptedLLM:
             )
         )
         self.tiers_used.append(tier)
-        if self._fail_with is not None:
-            raise self._fail_with
+        self._maybe_fail()
         if not self._responses:
             raise LLMError("ScriptedLLM 没有更多预置响应了", retryable=False)
         item = self._responses.pop(0)

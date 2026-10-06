@@ -160,6 +160,20 @@ def validate_plan(
     v: list[str] = []
     ids = plan.node_ids
 
+    # **空计划先判，而且只判这一条。** 一个节点都没有时，下面每一条检查
+    # （依赖存在性、工具合法性、join 一致性、预算）都在空集上恒真——它们会全部
+    # 静默通过，只有 `strategy=single_step 但节点数为 0` 会亮，而那条消息把
+    # "根本没有步骤"说成了"策略与节点数不匹配"，排查的人会去翻策略。
+    #
+    # 这是 P0-1c 的现场：拆解器返回了空 nodes，消费端收到的却是一个指向
+    # strategy 的错误。空计划是**模型没能产出计划**，不是计划写错了——
+    # 两者该说的话不一样，所以这里单独说，并且不再往下走。
+    if not plan.nodes:
+        return [
+            "计划没有任何节点：拆解器没有产出任何可执行步骤（LLM 拆解返回了空 nodes）。"
+            "这与节点内容是否合法无关——是这一版拆解整体为空，需要重新拆解。"
+        ]
+
     if len(ids) != len(set(ids)):
         dupes = sorted({i for i in ids if ids.count(i) > 1})
         v.append(f"subtask_id 重复：{dupes}")
