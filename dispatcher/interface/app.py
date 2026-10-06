@@ -24,7 +24,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from ..core.contract import TaskEnvelope, wire_dump
 from ..core.errors import DispatcherError
-from ..core.events import TERMINAL_EVENTS, to_sse_heartbeat
+from ..core.events import TERMINAL_EVENTS, to_sse, to_sse_heartbeat
 from ..core.state import TERMINAL_STATUSES
 from ..pipeline import Dispatcher, describe_config
 
@@ -421,7 +421,10 @@ def create_app() -> FastAPI:
                     skipped = len(backlog) - replay_limit
                     backlog = backlog[-replay_limit:]
                     # 如实告知被截断，而不是安静地少给
-                    from ..core.events import EventRecord, to_sse
+                    # **不要在这里 import to_sse**：函数内任何位置的一次赋值/导入
+                    # 都会让这个名字在整个 gen 作用域里变成局部变量，于是下面
+                    # `yield to_sse(ev)` 在没走截断分支时抛 UnboundLocalError（实测 500）。
+                    from ..core.events import EventRecord
 
                     yield to_sse(EventRecord(
                         seq=backlog[0].seq - 1, task_id=task_id, type="error",

@@ -474,9 +474,15 @@ class Decomposer:
         **宽容读取**（缺字段给默认值），但接下来会过**严格校验**——
         宽容 + 严格比严格 + 信任安全得多：模型的输出永远会有小偏差，
         而把偏差交给集合校验处理，比试图让它一次就完全正确现实。
+
+        宽容必须是**真的宽容**：形状不对的字段要退化成"当作没有"，而不是让它抛异常。
+        实测（2026-10-06）模型把 `inputs` 返回成了字符串数组，
+        ``dict([...])`` 当场抛 ``ValueError``，请求以 **500**（未捕获异常）收场——
+        本该是一条"这一版计划不合法，重规划"的路径。于是所有结构字段统一走
+        :func:`_as_dict` / :func:`_as_list` 收口，与评估器里同一条纪律。
         """
         nodes: list[Node] = []
-        for i, n in enumerate(raw.get("nodes") or []):
+        for i, n in enumerate(_as_list(raw.get("nodes"))):
             if not isinstance(n, dict):
                 continue
             executor = n.get("executor") or ("agent" if n.get("role") else "tool")
@@ -485,12 +491,12 @@ class Decomposer:
                 "name": n.get("name"),
                 "handler": str(n.get("handler") or decision.handler or ""),
                 "executor": executor,
-                "depends_on": [str(d) for d in (n.get("depends_on") or [])],
-                "inputs": dict(n.get("inputs") or {}),
+                "depends_on": _as_str_list(n.get("depends_on")),
+                "inputs": _as_dict(n.get("inputs")),
                 "output_schema_ref": n.get("output_schema_ref"),
                 "model_tier": n.get("model_tier") if n.get("model_tier") in
                 self._policy.model_tier_ids else None,
-                "required_capabilities": [str(c) for c in (n.get("required_capabilities") or [])],
+                "required_capabilities": _as_str_list(n.get("required_capabilities")),
                 "timeout_ms": _int(n.get("timeout_ms")),
                 "optional": bool(n.get("optional")),
                 "on_failure": n.get("on_failure")
@@ -503,13 +509,13 @@ class Decomposer:
                 body["tool"] = n.get("tool")
             else:
                 body["role"] = n.get("role")
-                body["tool_whitelist"] = [str(t) for t in (n.get("tool_whitelist") or [])]
+                body["tool_whitelist"] = _as_str_list(n.get("tool_whitelist"))
                 body["max_rounds"] = _int(n.get("max_rounds"))
                 body["on_round_limit"] = n.get("on_round_limit")
             nodes.append(Node(**body))
 
         edges = []
-        for e in raw.get("edges") or []:
+        for e in _as_list(raw.get("edges")):
             if isinstance(e, dict) and e.get("from") and e.get("to"):
                 edges.append({"from": str(e["from"]), "to": str(e["to"])})
         if not edges:
@@ -518,8 +524,8 @@ class Decomposer:
             ]
 
         join = {
-            str(k): [str(x) for x in (v or [])]
-            for k, v in (raw.get("join") or {}).items()
+            str(k): _as_str_list(v)
+            for k, v in _as_dict(raw.get("join")).items()
             if isinstance(v, list)
         }
 
@@ -576,6 +582,23 @@ def _request_text(envelope: TaskEnvelope) -> str:
     for m in envelope.input.media or []:
         parts.append(f"[媒体 {m.media_id}，{m.kind}/{m.mime}]")
     return "\n".join(p for p in parts if p)
+
+
+def _as_dict(v: Any) -> dict:
+    """模型给的可能是字符串、数组、null。**不在预期形状就当作没有**。
+
+    与 ``evaluator._as_dict`` 同一条纪律，理由也一样：模型输出是不可信输入，
+    类型也会错；一个字段形状不对不该让整条请求以 500 收场。
+    """
+    return v if isinstance(v, dict) else {}
+
+
+def _as_list(v: Any) -> list:
+    return v if isinstance(v, list) else []
+
+
+def _as_str_list(v: Any) -> list[str]:
+    return [str(x) for x in _as_list(v) if isinstance(x, (str, int, float))]
 
 
 def _int(v: Any) -> int | None:

@@ -40,9 +40,10 @@ from dispatcher.adapters.memory_media import InMemoryMediaStore
 from dispatcher.adapters.memory_state import InMemoryStateStore
 from dispatcher.core.agents import load_agents
 from dispatcher.core.budget import BudgetLedger
-from dispatcher.core.contract import TaskEnvelope
+from dispatcher.core.contract import TaskEnvelope, TaskProfile
 from dispatcher.core.errors import DispatcherError
 from dispatcher.core.eventbus import EventBus
+from dispatcher.core.guard import RawDecision, apply_guard
 from dispatcher.core.plan import ExecutionPlan, Node, PlanBudget, validate_plan
 from dispatcher.core.policy import Policy, load_policy
 from dispatcher.core.pricing import load_pricing
@@ -324,5 +325,195 @@ async def test_p01c_degraded_authoritative_reaches_succeeded(taxonomy: Taxonomy)
         # 真的产出了凭证，而不是"成功但空手而归"
         assert cur.artifacts["write"]["amount"] == 38.5
         assert cur.artifacts["write"]["direction"] == "expense"
+    finally:
+        await d.aclose()
+
+
+# ===========================================================================
+# C 组 —— 答复澄清后恢复执行（消费端 22:11 复测的那半条）
+# ===========================================================================
+CLARIFY_PROFILE = {
+    "task_type": "bookkeeping.capture_from_receipt",
+    "intent_summary": "文字说午饭 38，截图是星巴克 38.50，需确认记哪一笔",
+    "complexity": {"score": 0.6, "reasons": ["两个来源金额不一致"]},
+    "urgency": {"level": "normal"},
+    "vision": {"expected_extraction": ["amount", "merchant"]},
+    "candidate_capabilities": ["bookkeeping.expense.record"],
+    "required_capabilities": ["bookkeeping.expense.record"],
+    "data_sensitivity": "financial",
+    "recommended_mode": "async",
+    "needs_clarification": True,
+    "clarification": {
+        "question": '文字说"午饭花了38"，截图却是 38.50 元。要记哪一笔？',
+        "options": [],
+        "blocking": True,
+    },
+    "confidence": 0.5,
+}
+
+# 关键：**故意不给 handler**，并把工具名写成模型编的（实测就是这样）。
+# 这逼着守卫去推 handler——推不出来就会把这条正确的 decompose 路由降级成
+# single_tool_action，然后拆解器拿不到 handler，产出 `handler: ''` 的节点 → 422。
+DECISION_WITHOUT_HANDLER = {
+    "route_id": "vision_extract_then_write",
+    "model_tier": "standard",
+    "tool_set": ["extract_receipt", "classify_merchant", "record_entry"],
+    "execution_mode": "async",
+    "decompose": True,
+    "budget": {"max_cost": 0.08, "max_wall_ms": 60000, "max_llm_calls": 8},
+    "rationale": "含支付截图，需视觉抽取后落账。",
+    "confidence": 0.6,
+}
+
+EXTRACT_FINAL = {"final": {"amount": 38.5, "currency": "CNY", "merchant": "星巴克咖啡（国贸店）",
+                           "direction": "expense", "category": "餐饮", "confidence": 0.91}}
+NORMALIZE_FINAL = {"final": {"merchant": "星巴克咖啡（国贸店）", "category": "餐饮"}}
+
+
+async def test_clarify_resume_runs_the_existing_decision_and_succeeds():
+    """答复澄清后恢复执行：走已有 decision，不再出现「decompose=false 却因空计划被拒」。
+
+    这条覆盖消费端 22:11 复测里坏掉的那半步。要点有三个：
+
+    1. 提交时有澄清 → 任务停在 ``awaiting_clarification``，**此时还没有 decision**
+       （``_advance`` 在评估后就 return 了）；
+    2. 答复后恢复，路由在这一刻才跑，产出的是 ``vision_extract_then_write``
+       （decompose 路由）——注意模型**没给 handler**；
+    3. 守卫按画像能力把 handler 推出来，**路由不再被降级**，模板按 hint 命中，
+       四个节点跑完 → ``succeeded``。
+    """
+    llm = ScriptedLLM([CLARIFY_PROFILE, DECISION_WITHOUT_HANDLER,
+                       EXTRACT_FINAL, NORMALIZE_FINAL])
+    d = make_dispatcher(llm)
+    try:
+        env = await receipt_envelope(d, authoritative=True, intent=DECLARED_INTENT)
+
+        first = await d.submit(env)
+        assert first.status == "awaiting_clarification", first.error
+        assert first.decision is None, "澄清发生在路由之前，此刻不该有 decision"
+        assert first.clarification["options"] == [], "选项可以为空，客户端须走 free_text"
+
+        resumed = await d.clarify(
+            first.task_id, {"question_id": first.clarification["question_id"],
+                            "free_text": "按截图的38.50记"}
+        )
+        assert resumed.status != "rejected", resumed.error
+        await drain(d, first.task_id)
+        cur = await d.get(first.task_id)
+
+        assert cur.status == "succeeded", cur.error
+
+        # 路由没有被降级——这是这次修复的核心
+        assert cur.decision.route_id == "vision_extract_then_write"
+        assert cur.decision.path == "decompose"
+        assert cur.decision.decompose is True
+        assert "handler_fallback" not in cur.decision.guard.applied
+        assert "handler_not_registered" not in cur.decision.guard.violations
+        # handler 由画像能力推出，而不是模型给的（模型根本没给）
+        assert cur.decision.handler == "bookkeeping"
+        # 模型编的工具名被集合代数剔掉，而不是让整单失败
+        assert cur.decision.tool_set == []
+
+        assert cur.plan_meta["source"] == "flow_template:receipt_to_entry"
+        assert len(cur.plan["nodes"]) == 4
+        assert cur.artifacts["write"]["amount"] == 38.5
+    finally:
+        await d.aclose()
+
+
+async def test_decision_without_handler_is_not_downgraded_by_the_guard():
+    """守卫层的定向断言：handler 缺失时可从画像能力推出，**不降级路由**。
+
+    与上面那条分开写，是为了让失败点一目了然——上一条红了可能是恢复路径的问题，
+    这一条红了则明确指向守卫的推导逻辑。
+    """
+    policy = load_policy(get_settings().policy_path)
+    reg = build_registry(REPO_ROOT / "config" / "handlers.yaml")
+    profile = _profile_from(CLARIFY_PROFILE, policy)
+
+    out = apply_guard(
+        policy,
+        RawDecision(route_id="vision_extract_then_write", model_tier="standard",
+                    handler=None, tool_set=["extract_receipt", "classify_merchant"]),
+        profile=profile, handler_ids=reg.ids,
+        handler_tools=reg.tool_map(), handler_caps=reg.capability_map(),
+    )
+    assert out.decision.handler == "bookkeeping"
+    assert out.decision.route_id == "vision_extract_then_write"
+    assert out.decision.decompose is True
+    # 编造的工具名被集合代数剔掉是对的（tool_set_intersected）；要断言的是
+    # **路由与 handler 没有被降级**——那才是把正确决策改错的那一步。
+    assert "handler_fallback" not in out.decision.guard.applied
+    assert "route_fallback" not in out.decision.guard.applied
+    assert out.decision.tool_set == []
+
+
+async def test_ambiguous_capabilities_do_not_guess_a_handler():
+    """反向对照：能力同时命中多个 handler 时**不猜**，宁可不推。
+
+    没有这条，"唯一定位"就可能被写成"取第一个命中的"——那会在多领域请求上
+    安静地选错 handler，比明确报错危险得多。
+    """
+    policy = load_policy(get_settings().policy_path)
+    reg = build_registry(REPO_ROOT / "config" / "handlers.yaml")
+    profile = _profile_from(
+        dict(CLARIFY_PROFILE, candidate_capabilities=[
+            "bookkeeping.expense.record", "calendar.create_event"]),
+        policy,
+    )
+    out = apply_guard(
+        policy,
+        RawDecision(route_id="vision_extract_then_write", model_tier="standard", handler=None),
+        profile=profile, handler_ids=reg.ids,
+        handler_tools=reg.tool_map(), handler_caps=reg.capability_map(),
+    )
+    assert out.decision.handler is None
+    assert any("无法唯一确定" in n for n in out.notes)
+
+
+def _profile_from(raw: dict, policy: Policy):
+    """把评估器的原始输出形状补成一份完整画像。
+
+    ``modality`` 与 ``vision.required`` 由评估器**代码**推导（不采信模型自述），
+    因此原始输出里没有——这里补上，模拟评估器产出后的那一份。
+    """
+    vision = raw.get("vision")
+    return TaskProfile.model_validate({
+        **raw,
+        "policy_version": policy.policy_version,
+        "modality": raw.get("modality") or ["image", "text"],
+        "vision": {"required": True, **(vision or {})},
+    })
+
+
+# ===========================================================================
+# D 组 —— 拆解器对畸形模型输出必须宽容，而不是 500
+# ===========================================================================
+@pytest.mark.parametrize("bad_nodes", [
+    # 实测：模型把 inputs 返回成字符串数组，dict([...]) 当场抛 ValueError → HTTP 500
+    [{"subtask_id": "a", "handler": "bookkeeping", "inputs": ["media_ref", "text_hint"]}],
+    # join 是数组而不是对象 → .items() 抛 AttributeError
+    [{"subtask_id": "a", "handler": "bookkeeping"}],
+    # nodes 整个不是数组
+    None,
+])
+async def test_malformed_decomposer_output_is_rejected_not_a_500(bad_nodes):
+    """形状不对的字段要退化成"当作没有"，不能让请求变成未捕获异常的 500。
+
+    这条与 P0-1c 同源：拆解器面对的是**不可信输入**，它自称"宽容读取"就必须真的宽容。
+    """
+    raw_plan = {"strategy": "dag"}
+    if bad_nodes is not None:
+        raw_plan["nodes"] = bad_nodes
+    raw_plan["join"] = ["not-an-object"]
+
+    llm = ScriptedLLM([DEGRADED_PROFILE, FREEFORM_DECISION, raw_plan, raw_plan])
+    d = make_dispatcher(llm)
+    try:
+        env = await receipt_envelope(d, authoritative=False, intent=None)
+        # 关键：必须是**有类型的拒绝**，而不是 ValueError 冒到 HTTP 层变 500
+        with pytest.raises(DispatcherError) as ei:
+            await d.submit(env)
+        assert ei.value.code == "policy_violation"
     finally:
         await d.aclose()

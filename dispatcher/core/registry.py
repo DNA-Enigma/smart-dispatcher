@@ -143,6 +143,14 @@ class HandlerRegistry:
         """守卫用的 {handler_id: 工具名集合}。"""
         return {h: self.tool_names(h) for h in self._manifests}
 
+    def capability_map(self) -> dict[str, frozenset[str]]:
+        """守卫用的 {handler_id: 能力名集合}。
+
+        与 ``tool_map`` 并列：**归属判定有两条可用的集合**。工具名能定归属，
+        能力名同样能——能力名按约定带领域前缀，交集判定与"这组工具归谁"一样是纯子集运算。
+        """
+        return {h: frozenset(m.capabilities) for h, m in self._manifests.items()}
+
     def all_capabilities(self) -> frozenset[str]:
         out: set[str] = set()
         for m in self._manifests.values():

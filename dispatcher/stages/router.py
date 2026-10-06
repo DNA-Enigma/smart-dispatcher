@@ -152,6 +152,7 @@ class Router:
             profile=profile,
             handler_ids=self._registry.ids,
             handler_tools=self._registry.tool_map(),
+            handler_caps=self._registry.capability_map(),
             constraints_max_cost=envelope.constraints.max_cost,
             constraints_max_wall_ms=envelope.constraints.max_wall_ms,
             mode_preference=envelope.constraints.mode_preference,

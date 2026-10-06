@@ -91,6 +91,7 @@ def apply_guard(
     profile: TaskProfile,
     handler_ids: frozenset[str],
     handler_tools: Mapping[str, frozenset[str]],
+    handler_caps: Mapping[str, frozenset[str]] | None = None,
     constraints_max_cost: float | None = None,
     constraints_max_wall_ms: int | None = None,
     mode_preference: str = "auto",
@@ -102,6 +103,7 @@ def apply_guard(
     因此本函数**不依赖具体的 handler 实现**，只依赖它声明的集合。
     """
     health: Mapping[str, HealthState] = tier_health or {}
+    handler_caps = handler_caps or {}
     applied: list[GuardAction] = []
     violations: list[str] = []
     notes: list[str] = []
@@ -140,6 +142,29 @@ def apply_guard(
             notes.append(f"handler 由 tool_set 推导得出：{handler}")
         elif len(owners) > 1:
             notes.append(f"tool_set 同时属于多个 handler {sorted(owners)}，无法唯一确定")
+
+    # 模型既没给 handler、tool_set 也定不了归属时，**再用能力画像推一次**。
+    #
+    # 这是实测补上的第二条推导路径（2026-10-06）。现场是：路由器正确选了
+    # `vision_extract_then_write`，rationale 把理由写得清清楚楚，却把 `handler`
+    # 留空、给出的工具名一个都不属于任何已注册 handler。于是下面第 2 步判定
+    # `handler_not_registered`，把这条**正确的 decompose 路由**降级成兜底路由
+    # `single_tool_action`（path 从 decompose 变成 single_step_tool），
+    # 接着拆解器见"单步但点不出工具"改走自由拆解，而自由拆解没有 handler 可依，
+    # 产出一堆 `handler: ''` 的节点 → 422。**守卫把对的决策改错了。**
+    #
+    # 能力名带领域前缀（`bookkeeping.*` / `calendar.*`），交集判定与上面从 tool_set
+    # 推导是同一种纯子集运算，不引入任何领域语义。仍然只在**唯一确定**时才采纳。
+    if handler is None:
+        wanted_caps = set(profile.candidate_capabilities) | set(profile.required_capabilities)
+        owners = [
+            hid for hid, caps in handler_caps.items() if caps & wanted_caps
+        ]
+        if len(owners) == 1:
+            handler = owners[0]
+            notes.append(f"handler 由画像能力推导得出：{handler}")
+        elif len(owners) > 1:
+            notes.append(f"画像能力同时命中多个 handler {sorted(owners)}，无法唯一确定")
 
     if route.requires_handler:
         if handler is None or handler not in handler_ids:
