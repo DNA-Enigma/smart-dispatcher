@@ -253,10 +253,32 @@ token，又会在同一个形状上反复产生小幅幻觉（顺序变化、多
 
 > **多 Agent 协作的完整设计见 [11-multi-agent.md](11-multi-agent.md)。**
 
+## 节点超时 `timeout_ms`：是"每次调用"，不是"每个节点"
+
+**实测修正（2026-10-06）。** 模板里的 `timeout_ms` 读起来像节点级上限，实际语义是
+**单次 LLM 调用**的超时。证据链：
+
+- 接线点只有一处——`NodeExecutor._run_agent` 在**每一轮**循环里
+  `ctx.llm_json(..., timeout_ms=node.timeout_ms)`；
+- 该值传到 `OpenAICompatibleLLM` 后变成 httpx 单次 POST 的 `timeout=`；
+- `DagRunner` 里**没有任何节点级墙钟**（没有 `wait_for`，也不对 `timeout_ms` 求和）。
+
+于是节点总耗时上限 ≈ `timeout_ms × max_rounds × (1 + retry.max)`。`receipt_to_entry`
+的 `extract`（`max_rounds: 4`、`retry.max: 1`、`timeout_ms: 20000`）最坏可跑到
+160 秒——**实跑 54.2 秒仍成功，是符合预算的，不是超时失效**。`normalize`
+（`max_rounds: 3`、8s）同理，14.7 秒在预算内。
+
+**已知缺口**：`executor: tool` 的节点上 `timeout_ms` **完全不参与**——`_run_tool`
+不传它，工具内部自调的 `ctx.llm(...)` 也不带超时，于是退回全局默认
+（`settings.llm_request_timeout_s`）。对 `dedupe` / `write` 这类不碰模型的确定性工具
+无害；对**会调模型**的 tool 节点（如 `extract_receipt_fields`）则意味着节点声明的
+超时被绕过。`tests/test_node_timeout.py` 把这个现状钉住了。
+
 ## 执行前的确定性校验
 
 **这一层是幻觉的拦截网**，且全是泛化的、无语义的检查：
 
+- **计划至少有一个节点**（空计划单独判、最早判，并在空集上短路——其余检查在空集上恒真）
 - DAG 无环
 - 所有 `depends_on` 目标存在
 - 所有 `tool` ∈ `handler.tool_names`

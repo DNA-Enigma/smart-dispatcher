@@ -25,6 +25,9 @@ class RecordedCall:
     temperature: float | None
     options: dict
     json_mode: bool
+    # 记录每次调用携带的超时。它是"节点 timeout_ms 到底怎么生效"的唯一机械证据：
+    # 超时是按**每次 LLM 调用**计时的，因此一个节点的多轮循环会把预算乘起来。
+    timeout_ms: int | None = None
 
     @property
     def system_text(self) -> str:
@@ -103,6 +106,7 @@ class ScriptedLLM:
             RecordedCall(
                 messages=list(messages), tier=tier, requires=tuple(requires),
                 temperature=temperature, options=options or {}, json_mode=json_mode,
+                timeout_ms=timeout_ms,
             )
         )
         self.tiers_used.append(tier)
@@ -131,6 +135,7 @@ class ScriptedLLM:
             RecordedCall(
                 messages=list(messages), tier=tier, requires=tuple(requires),
                 temperature=temperature, options=options or {}, json_mode=True,
+                timeout_ms=timeout_ms,
             )
         )
         self.tiers_used.append(tier)
