@@ -111,8 +111,15 @@
 ## 8. 消费端的反馈记录
 
 记账 APP 那边报过一份 8 条实测问题清单
-（`/home/dzsun/projects/ai-bookkeeping/docs/dispatcher-issues.md`），
-**已全部处理完毕**。那份报告的形式很好用，值得作为标准：
+（`/home/dzsun/projects/ai-bookkeeping/docs/dispatcher-issues.md`）。
+**2026-10-06 状态：P0 三条已修复并经 PM 端到端复测**（提交→澄清→答复→succeeded，
+230 测试全过）；**P1/P2 尚未全清**——P1-4b（clarify/feedback 裸 `request.json()`
+无校验）、P1-5（openapi 与策略的 HEIC 不一致）、P2-6（事件重放无条数上限）、
+P2-7（无 token 发放端点）、P2-8（错误 detail 为空）仍是开口项，见路线图
+`ai-bookkeeping/docs/product-roadmap.md` 的 P2-c。此句 2026-10-06 由 PM 修正——
+上一版写"已全部处理完毕"与实测不符。
+
+那份报告的形式很好用，值得作为标准：
 
 - 每条都有**复现命令**与**证据**（不是读代码推测的）
 - 按优先级排序（P0/P1/P2）
