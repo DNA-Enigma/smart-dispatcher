@@ -88,6 +88,34 @@ RECEIPT_DECISION = {
     "confidence": 0.88,
 }
 
+SCHEDULE_PROFILE = {
+    "task_type": "calendar.create_event",
+    "intent_summary": "把“明天下午三点开会”落成一条日程",
+    "complexity": {"score": 0.45, "reasons": ["相对时间需先解析成绝对时间"]},
+    "urgency": {"level": "normal"},
+    "required_capabilities": ["calendar.create_event"],
+    "candidate_capabilities": ["calendar.create_event"],
+    "recommended_mode": "async",
+    "needs_clarification": False,
+    "confidence": 0.9,
+}
+
+SCHEDULE_DECISION = {
+    "route_id": "schedule_parse_then_create",
+    "model_tier": "standard",
+    "handler": "calendar",
+    "tool_set": ["parse_natural_time", "create_event"],
+    "execution_mode": "async",
+    "decompose": True,
+    "budget": {"max_cost": 0.05, "max_wall_ms": 60000, "max_llm_calls": 6},
+    "rationale": "相对时间要先解析成绝对时间才能建日程。",
+    "confidence": 0.9,
+}
+
+# parse_natural_time 的产出（它自己会调一次模型）。
+PARSE_TIME = {"iso": "2026-10-07T15:00:00+08:00", "ambiguous": False, "note": ""}
+
+
 
 def make_dispatcher(llm, *, execution_enabled: bool = True, state=None):
     s = get_settings()
@@ -220,6 +248,46 @@ async def test_template_hit_avoids_llm_decomposition():
         # entry_id 由幂等 token 推出——消费端拿它当唯一约束，重试不会重复入账
         assert entry["entry_id"] == f"{cur.task_id}:write"
         assert entry["source_task"] == cur.task_id
+    finally:
+        await d.aclose()
+
+
+async def test_schedule_template_parses_time_then_creates_event():
+    """日程模板命中：parse → create 两步真的都跑完，日程被建出来。
+
+    这正是 docs/HANDOFF.md 第 7 节记录的缺口："明天下午三点开会"曾能解析出正确的
+    时间戳，却**没建成日程**——因为自由拆解不保证"解析之后一定要写"。
+    模板把这两步的依赖固化下来，依赖的存在使 create 的 start 只能来自 parse 的产出。
+    """
+    from dispatcher.core.state import TERMINAL_STATUSES as TERM
+
+    llm = ScriptedLLM([SCHEDULE_PROFILE, SCHEDULE_DECISION, PARSE_TIME])
+    d = make_dispatcher(llm)
+    try:
+        rec = await d.submit(text_env("明天下午三点开会", mode="async"))
+        # 规划是内联跑完的，拆解阶段就能看出命中模板
+        assert rec.plan is not None
+        assert rec.plan_meta["source"] == "flow_template:schedule_parse_to_create", rec.plan_meta
+        assert rec.plan_meta["template_miss"] is False
+        assert [n["subtask_id"] for n in rec.plan["nodes"]] == ["parse", "create"]
+
+        # 模型只被调了三次：评估 + 路由 + 时间解析。拆解那一次被模板省掉了。
+        for _ in range(200):
+            cur = await d.get(rec.task_id)
+            if cur.status in {"succeeded", "failed", "cancelled"}:
+                break
+            await asyncio.sleep(0.01)
+        cur = await d.get(rec.task_id)
+        assert cur.status in TERM, cur.error
+        assert cur.status == "succeeded", cur.error
+        assert cur.decision.route_id == "schedule_parse_then_create"
+        assert len(llm.calls) == 3, [c.tier for c in llm.calls]
+
+        # 日程真的建出来了：start 用的是 parse 的产出，不是原话里的相对说法
+        event = cur.artifacts["create"]["event"]
+        assert event["start"] == PARSE_TIME["iso"]
+        assert event["title"] == "明天下午三点开会"
+        assert event["token"].startswith(cur.task_id)
     finally:
         await d.aclose()
 

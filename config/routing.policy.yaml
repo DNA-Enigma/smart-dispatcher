@@ -138,13 +138,30 @@ routes:
     # 抽取置信度低于此值时先问用户，不猜。这是记账场景最重要的一条策略。
     requires_confirmation_below_confidence: 0.75
 
+  - id: schedule_parse_then_create
+    when: >
+      用户要新建一条日程或提醒，且时间是自然语言的相对表达
+      （"明天下午三点""下周三上午"），必须先解析成绝对时间才能写入。
+      判断依据：create_event 的必填参数 start 一次填不出来，得先由
+      parse_natural_time 产出——中间存在真实依赖，因此不是 single_tool_action。
+      若时间已经是明确的绝对时间、或调整的是已有日程，则不属于本路由
+      （后者走改期，不能套用"新建"的模板）。
+    path: decompose
+    default_tier: standard
+    allowed_tiers: [cheap, standard]
+    requires_handler: true
+    evaluate: always
+    tool_policy: handler_authorized_subset
+    flow_template_hint: schedule_parse_to_create
+    max_cost: 0.05
+    mode: async
+
   - id: multi_step_analysis
     when: >
       多步任务，且步骤之间存在真实依赖，或需要综合多个来源、多次工具往返
       才能得出结论（例如"分析我这三个月的支出结构并给出下月预算建议"）。
       典型情形：某个工具的必填参数需要先由另一次调用产出——
-      例如"明天下午三点开会"要先把相对时间解析成绝对时间才能建日程；
-      "把这笔消费记一下"要先查重才能安全入账。
+      例如"把这笔消费记一下"要先查重才能安全入账。
       步骤之间没有依赖、可以各自独立完成时，不应选本路由。
       本路由不必给出 tool_set：拆解阶段会决定用哪些工具。
     path: decompose

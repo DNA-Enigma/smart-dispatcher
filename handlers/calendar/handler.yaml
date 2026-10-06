@@ -16,7 +16,11 @@ capabilities:
   - calendar.query
   - calendar.reschedule
 
-flows: []
+# 本 handler 随附的流程模板（见 config/flow_templates/）。
+# "新建日程"的形状是确定的（先解析相对时间、再写入），固化下来就不必每次让
+# 拆解器重新判断两步之间的依赖。
+flows:
+  - schedule_parse_to_create
 
 required_ports: [store]
 

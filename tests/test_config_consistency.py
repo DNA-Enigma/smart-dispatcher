@@ -252,6 +252,45 @@ def test_flow_template_max_parallelism_within_limits(repo_root: Path, policy: Po
         assert tpl["max_parallelism"] <= policy.limits.max_parallelism, p.name
 
 
+def test_route_flow_template_hint_resolves_to_a_real_template(repo_root: Path, policy: Policy):
+    """路由的 ``flow_template_hint`` 必须指向一个真实存在的模板文件。
+
+    这是"契约与配置各写一份就会分叉"的一处现场：hint 写在 routing.policy.yaml，
+    模板写在 flow_templates/*.yaml，两边没有任何代码把对应关系钉住。
+    拼错一个 id **不会报错**——``Decomposer._matching_template`` 只会在模板表里
+    查不到，于是静默退化成自由拆解，那张模板等于不存在。静默失效比报错更糟，
+    因此在 CI 里挡一次。
+    """
+    templates = {
+        load_yaml(p)["template_id"]
+        for p in (repo_root / "config" / "flow_templates").glob("*.yaml")
+    }
+    missing = sorted(
+        f"{r.id} -> {r.flow_template_hint}"
+        for r in policy.routes
+        if r.flow_template_hint and r.flow_template_hint not in templates
+    )
+    assert not missing, f"路由的 flow_template_hint 指向不存在的模板：{missing}"
+
+
+def test_every_flow_template_is_declared_in_its_handler_flows(repo_root: Path, registry):
+    """每个模板都要在它 handler 的 manifest ``flows`` 里登记。
+
+    handler 的 ``flows`` 是"这个领域随附了哪些模板"的声明。模板文件存在、
+    handler 却没登记，说明两处已经不同步——反方向不做检查，因为 ``flows``
+    可以声明一个尚未落地的模板（例如 bookkeeping 的 monthly_reconciliation），
+    那是有意的占位而不是错误。
+    """
+    for p in sorted((repo_root / "config" / "flow_templates").glob("*.yaml")):
+        tpl = load_yaml(p)
+        manifest = registry.manifest(tpl["handler"])
+        assert manifest is not None, f"{p.name} 指向未注册的 handler {tpl['handler']!r}"
+        assert tpl["template_id"] in manifest.flows, (
+            f"{p.name} 的模板 {tpl['template_id']} 未在 handler "
+            f"{tpl['handler']} 的 flows 中登记"
+        )
+
+
 # ---------------------------------------------------------------------------
 # taxonomy
 # ---------------------------------------------------------------------------

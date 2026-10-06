@@ -1,0 +1,116 @@
+# =============================================================================
+# 流程模板：自然语言日程 → 建日程
+# =============================================================================
+# 与 receipt_to_entry 同构：把"形状已知"的流程固化成具名 DAG，避免每次请求都让
+# LLM 重新拆一遍。
+#
+# 这张模板补的是一个**实测出来的缺口**（见 docs/HANDOFF.md 第 7 节）：
+# "明天下午三点开会"会被正确解析出一个绝对时间戳，却**不会真的建出日程**——
+# 因为自由拆解没有保证"解析之后一定要写"。日程创建的两步依赖是确定的
+# （create_event 的必填参数 start 必须由 parse_natural_time 产出），
+# 这种形状就不该交给模型每次重新判断。
+#
+# 逻辑上是三步：**parse（解析相对时间）→ confirm（必要时问用户）→ create（写入）**。
+# 其中 confirm 不是图中的节点，而是下面 confirmation 段声明的**插入点**——
+# 计划节点的执行者只有 tool 与 agent 两种（见 schemas/execution_plan.json），
+# "停下来问用户"是执行期的机制而不是一种执行者：handler 的工具返回
+# ToolResult.confirm 时任务会停在 awaiting_clarification，答复后从断点继续。
+# 因此这里与 receipt_to_entry 用同一段声明表达，而不是造第三个节点。
+# =============================================================================
+
+template_id: schedule_parse_to_create
+version: "1.0"
+handler: calendar
+
+# 命中条件：由 03 拆解器判定。这里是给 LLM 读的散文，不是关键词列表。
+applies_when: >
+  用户要新建一条日程或提醒，且时间是自然语言的相对表达
+  （"明天下午三点""下周三上午"），必须先解析成绝对时间才能写入。
+  若时间已是明确的绝对时间、只需一次写入，则不适用（那是一次工具调用）。
+  若是调整**已有**日程的时间，也不适用——那要改的是记录而不是新建，
+  走改期路径，不能套用本模板。
+
+applies_to_capabilities:
+  - calendar.create_event
+
+inputs:
+  - name: text
+    required: true
+    description: 用户的原话，含日程标题与自然语言时间。
+  - name: now
+    required: true
+    description: 当前时间与时区。由调度层注入（ctx.now()），供时间解析使用。
+  - name: user_config
+    required: false
+    description: 该用户的日程配置（默认时长、工作时间、提醒提前量）。
+
+# -----------------------------------------------------------------------------
+# 节点图。两步严格串行：create 的 start 只能来自 parse 的产出，
+# 中间没有可并行的分支，因此 max_parallelism 为 1。
+# =============================================================================
+
+nodes:
+  # ---- tool：时间解析本身需要理解语言（"下周三"是哪个周三），标了 text 能力 ----
+  - id: parse
+    name: 解析自然语言时间
+    executor: tool
+    tool: parse_natural_time
+    tier: cheap                     # 需要 text 能力，用最便宜的满足档
+    required_capabilities: [text]
+    depends_on: []
+    inputs:
+      # $ref 的命名空间：envelope.*（原始请求）、<subtask_id>.*（上游产出）。
+      text: { $ref: "envelope.input.text" }
+    timeout_ms: 8000
+    retry: { max: 1, backoff_ms: 500 }
+    idempotent: true
+    on_failure: fail_task
+
+  # ---- tool：输入是已定字段，输出唯一，没有任何可调整的余地 ----
+  - id: create
+    name: 新建日程
+    executor: tool
+    tool: create_event
+    tier: null                      # 纯写库，不需要模型
+    required_capabilities: []
+    depends_on: [parse]
+    inputs:
+      # title 直接取原话：当前工具集里没有单独的标题抽取步骤。
+      # 这是**已知的粗糙处**，不是疏漏——宁可先保证"日程真的被建出来"，
+      # 也不为了标题好看而多插一个节点（那会带来新的失败面）。
+      title: { $ref: "envelope.input.text" }
+      start: { $ref: "parse.iso" }
+    timeout_ms: 5000
+    idempotent: true                # 调度层注入稳定的 idempotency_token，重试不会重复建
+    on_failure: fail_task
+
+edges:
+  - { from: parse, to: create }
+
+join: {}
+
+max_parallelism: 1
+
+# -----------------------------------------------------------------------------
+# 人工确认的插入点（逻辑流程里的第二步 confirm）。
+#
+# 时间解析有歧义时（parse.ambiguous 为真）**停下来问**，而不是拿一个猜的绝对时间
+# 直接建日程——建错的日程用户往往到点才发现。
+#
+# 与 receipt_to_entry 的 confirmation 段同构：它描述的是"这一步之前应当有一次
+# 人工确认"，真正的确认动作由该步的 handler 工具返回 ToolResult.confirm 触发
+# （见 handlers/bookkeeping/handler.py 里 build_ledger_entry 的用法）。
+# 答复后任务从断点继续，已完成节点的产出保留。
+# -----------------------------------------------------------------------------
+confirmation:
+  insert_before: create
+  on_condition: parse.ambiguous == true
+  question_template: "我把时间理解成 {iso}，对吗？"
+  options:
+    - { id: confirm, label: 对，就这么建 }
+    - { id: edit, label: 改一下时间 }
+    - { id: cancel, label: 不用建了 }
+  blocking: true
+  # 超时未答复按 blocking=false 处理：任务停在 awaiting_clarification，
+  # 不自动按猜的时间建日程。
+  on_timeout: stay_pending

@@ -232,7 +232,8 @@ def test_guard_applied_is_never_produced_by_the_llm(policy, registry):
 
 
 @pytest.mark.parametrize("route_id", ["direct_answer", "single_tool_action",
-                                      "vision_extract_then_write", "multi_step_analysis",
+                                      "vision_extract_then_write",
+                                      "schedule_parse_then_create", "multi_step_analysis",
                                       "scheduled_aggregate"])
 def test_every_route_in_policy_is_reachable(policy, registry, route_id):
     """每条路由都必须能被选到——否则策略里存在死条目。"""
