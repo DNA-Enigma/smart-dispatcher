@@ -1,0 +1,15 @@
+{
+  "profile_version": "1.0",
+  "policy_version": "pv_2026-10-01_03",
+  "task_type": "bookkeeping.capture_from_receipt",
+  "intent_summary": "用户上传一张截图，但无法判断是收入还是支出。",
+  "modality": ["image"],
+  "complexity": { "score": 0.42, "band": "medium", "reasons": [] },
+  "urgency": { "level": "normal", "reasons": [] },
+  "required_capabilities": ["vision.extract"],
+  "recommended_mode": "async",
+  "needs_clarification": true,
+  "clarification": null,
+  "confidence": 0.41,
+  "degraded": false
+}

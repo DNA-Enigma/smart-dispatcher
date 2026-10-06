@@ -1,0 +1,159 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://smart-dispatcher.dev/schemas/run_log.json",
+  "title": "RunLog",
+  "description": "一次任务运行的遥测记录，是 04 Self-Evolve 的输入。设计上有两点必须坚持：其一 human_signal 是最有价值也最难获得的字段（记账场景的自然采集点就是用户的确认/修改页，用户改了分类就等于给出了一条带真值的标注）；其二 redaction 是强制的，金融截图默认不留存原图，分析只在结构化字段与哈希摘要上进行。",
+  "type": "object",
+  "required": ["run_id", "task_id", "user_id", "policy_version", "profile", "decision", "outcome", "redaction"],
+  "additionalProperties": false,
+  "properties": {
+    "run_id": { "type": "string" },
+    "task_id": { "type": "string" },
+    "parent_task_id": { "type": ["string", "null"], "description": "非空表示这是一次重跑。重跑率是质量问题的重要信号。" },
+    "tenant_id": { "type": "string" },
+    "user_id": { "type": "string" },
+    "source": { "type": "string", "enum": ["manual", "chat", "scheduled", "api"] },
+    "policy_version": { "type": "string", "description": "必填。没有它就无法比较不同策略版本的效果，金丝雀与 A/B 都做不了。" },
+    "started_at": { "type": "string", "format": "date-time" },
+    "ended_at": { "type": ["string", "null"], "format": "date-time" },
+
+    "profile": {
+      "type": "object",
+      "description": "画像的扁平摘要（非完整 TaskProfile），只保留检测器需要的字段。",
+      "required": ["task_type", "complexity_band", "confidence", "degraded"],
+      "additionalProperties": false,
+      "properties": {
+        "task_type": { "type": "string" },
+        "complexity_band": { "type": "string", "enum": ["low", "medium", "high"] },
+        "complexity_score": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "degraded": { "type": "boolean" },
+        "taxonomy_miss": { "type": ["boolean", "null"], "description": "画像给出的类型不在当前 taxonomy 中。该指标升高意味着词表缺项——可自动提出 taxonomy_add 建议。" },
+        "est_cost_max": { "type": ["number", "null"], "minimum": 0 }
+      }
+    },
+
+    "decision": {
+      "type": "object",
+      "required": ["route_id", "model_tier", "path", "confidence", "guard_applied", "fallback_used"],
+      "additionalProperties": false,
+      "properties": {
+        "route_id": { "type": "string" },
+        "model_tier": { "type": "string" },
+        "path": { "type": "string", "enum": ["direct_llm", "single_step_tool", "decompose"] },
+        "handler": { "type": ["string", "null"] },
+        "tool_set": { "type": ["array", "null"], "items": { "type": "string" } },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "guard_applied": { "type": "array", "items": { "type": "string" }, "description": "守卫施加的修正。守卫推翻率持续偏高意味着 when 散文已过时。" },
+        "fallback_used": { "type": "boolean" },
+        "model_resolved": { "type": ["string", "null"] },
+        "rationale": { "type": ["string", "null"] }
+      }
+    },
+
+    "plan": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "source": { "type": "string" },
+        "template_miss": { "type": ["boolean", "null"], "description": "本可套用模板却走了自由拆解。该指标升高意味着该补一个 flow_template。" },
+        "revision": { "type": "integer", "minimum": 1 },
+        "node_count": { "type": "integer", "minimum": 1 },
+        "max_parallelism": { "type": ["integer", "null"], "minimum": 1 },
+        "replans": { "type": "integer", "minimum": 0 }
+      }
+    },
+
+    "nodes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["subtask_id", "tool", "status", "attempts"],
+        "additionalProperties": false,
+        "properties": {
+          "subtask_id": { "type": "string" },
+          "tool": { "type": "string" },
+          "tier": { "type": ["string", "null"] },
+          "status": { "type": "string", "enum": ["succeeded", "failed", "skipped", "cancelled", "defaulted"] },
+          "attempts": { "type": "integer", "minimum": 0 },
+          "latency_ms": { "type": ["integer", "null"], "minimum": 0 },
+          "queue_ms": { "type": ["integer", "null"], "minimum": 0, "description": "等待并发槽位的时间。用于判断并发度配置是否偏低。" },
+          "tokens": {
+            "type": ["object", "null"],
+            "additionalProperties": false,
+            "properties": {
+              "in": { "type": "integer", "minimum": 0 },
+              "out": { "type": "integer", "minimum": 0 }
+            }
+          },
+          "cost": { "type": ["object", "null"], "additionalProperties": true },
+          "schema_validation": {
+            "type": ["object", "null"],
+            "additionalProperties": false,
+            "properties": { "ok": { "type": "boolean" }, "detail": { "type": ["string", "null"] } }
+          },
+          "escalated_from": { "type": ["string", "null"] },
+          "error_code": { "type": ["string", "null"] }
+        }
+      }
+    },
+
+    "outcome": {
+      "type": "object",
+      "required": ["status"],
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": ["succeeded", "failed", "cancelled", "budget_exceeded", "rejected"]
+        },
+        "wall_ms": { "type": ["integer", "null"], "minimum": 0 },
+        "total_cost": { "type": ["object", "null"], "additionalProperties": true },
+        "llm_calls": { "type": ["integer", "null"], "minimum": 0 },
+        "clarifications": { "type": ["integer", "null"], "minimum": 0 },
+        "escalations": { "type": ["integer", "null"], "minimum": 0 },
+        "retries": { "type": ["integer", "null"], "minimum": 0 },
+        "budget_warned": { "type": ["boolean", "null"] },
+        "errors": { "type": ["array", "null"], "items": { "type": "object", "additionalProperties": true } }
+      }
+    },
+
+    "human_signal": {
+      "type": ["object", "null"],
+      "description": "来自使用者的质量信号。记账场景的采集点就是确认/修改页——用户把分类从『其他』改成『餐饮』，这就是一条带真值的标注。没有它，04 只能靠延迟与成本反推，效果差一个量级。",
+      "additionalProperties": false,
+      "properties": {
+        "verdict": { "type": "string", "enum": ["accepted", "edited", "rejected", "ignored"] },
+        "edits": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["field", "from", "to"],
+            "additionalProperties": false,
+            "properties": {
+              "field": { "type": "string" },
+              "from": {},
+              "to": {}
+            }
+          }
+        },
+        "reason": { "type": ["string", "null"] },
+        "rework_count": { "type": ["integer", "null"], "minimum": 0 },
+        "signal_at": { "type": ["string", "null"], "format": "date-time" }
+      }
+    },
+
+    "redaction": {
+      "type": "object",
+      "description": "脱敏声明。必填，不是可选项——金融原始截图的留存必须显式决定。",
+      "required": ["media_retained"],
+      "additionalProperties": false,
+      "properties": {
+        "media_retained": { "type": "boolean" },
+        "media_retention_days": { "type": ["integer", "null"], "minimum": 0 },
+        "text_stored": { "type": "string", "enum": ["full", "hashed_summary", "none"] },
+        "sensitive_fields": { "type": ["array", "null"], "items": { "type": "string" } }
+      }
+    }
+  }
+}

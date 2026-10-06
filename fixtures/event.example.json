@@ -1,0 +1,19 @@
+{
+  "seq": 7,
+  "task_id": "task_01J8ZQ5N7P",
+  "type": "subtask.completed",
+  "ts": "2026-10-06T12:00:03.5Z",
+  "subtask_id": "extract",
+  "data": {
+    "subtask_id": "extract",
+    "output": {
+      "amount": 38.0,
+      "merchant": "某某餐厅",
+      "datetime": "2026-10-06T12:04:00+08:00",
+      "payment_method": "微信支付"
+    },
+    "cost": { "amount": 0.0078, "currency": "CNY" },
+    "latency_ms": 3100,
+    "escalated_from": null
+  }
+}

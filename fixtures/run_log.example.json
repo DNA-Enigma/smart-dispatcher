@@ -1,0 +1,124 @@
+{
+  "run_id": "run_01J8ZQ5N7P",
+  "task_id": "task_01J8ZQ5N7P",
+  "parent_task_id": null,
+  "tenant_id": "default",
+  "user_id": "u_123",
+  "source": "api",
+  "policy_version": "pv_2026-10-01_03",
+  "started_at": "2026-10-06T12:00:00Z",
+  "ended_at": "2026-10-06T12:00:05.4Z",
+  "profile": {
+    "task_type": "bookkeeping.capture_from_receipt",
+    "complexity_band": "medium",
+    "complexity_score": 0.42,
+    "confidence": 0.86,
+    "degraded": false,
+    "taxonomy_miss": false,
+    "est_cost_max": 0.021
+  },
+  "decision": {
+    "route_id": "vision_extract_then_write",
+    "model_tier": "standard",
+    "path": "decompose",
+    "handler": "bookkeeping",
+    "tool_set": ["extract_receipt_fields", "normalize_merchant", "dedupe_check", "build_ledger_entry"],
+    "confidence": 0.83,
+    "guard_applied": ["budget_clamped"],
+    "fallback_used": false,
+    "model_resolved": "<resolved-by-config>",
+    "rationale": "含支付截图，需视觉抽取后落账；去重依赖抽取结果，步骤间有依赖，故走 decompose 异步。"
+  },
+  "plan": {
+    "source": "flow_template:receipt_to_entry",
+    "template_miss": false,
+    "revision": 1,
+    "node_count": 4,
+    "max_parallelism": 3,
+    "replans": 0
+  },
+  "nodes": [
+    {
+      "subtask_id": "extract",
+      "tool": "extract_receipt_fields",
+      "tier": "standard",
+      "status": "succeeded",
+      "attempts": 1,
+      "latency_ms": 3100,
+      "queue_ms": 20,
+      "tokens": { "in": 1420, "out": 180 },
+      "cost": { "amount": 0.0078, "currency": "CNY" },
+      "schema_validation": { "ok": true, "detail": null },
+      "escalated_from": null,
+      "error_code": null
+    },
+    {
+      "subtask_id": "normalize",
+      "tool": "normalize_merchant",
+      "tier": "cheap",
+      "status": "succeeded",
+      "attempts": 2,
+      "latency_ms": 780,
+      "queue_ms": 0,
+      "tokens": { "in": 210, "out": 40 },
+      "cost": { "amount": 0.0004, "currency": "CNY" },
+      "schema_validation": { "ok": true, "detail": null },
+      "escalated_from": null,
+      "error_code": null
+    },
+    {
+      "subtask_id": "dedupe",
+      "tool": "dedupe_check",
+      "tier": null,
+      "status": "succeeded",
+      "attempts": 1,
+      "latency_ms": 45,
+      "queue_ms": 0,
+      "tokens": null,
+      "cost": { "amount": 0.0, "currency": "CNY" },
+      "schema_validation": { "ok": true, "detail": null },
+      "escalated_from": null,
+      "error_code": null
+    },
+    {
+      "subtask_id": "write",
+      "tool": "build_ledger_entry",
+      "tier": null,
+      "status": "succeeded",
+      "attempts": 1,
+      "latency_ms": 120,
+      "queue_ms": 0,
+      "tokens": null,
+      "cost": { "amount": 0.0, "currency": "CNY" },
+      "schema_validation": { "ok": true, "detail": null },
+      "escalated_from": null,
+      "error_code": null
+    }
+  ],
+  "outcome": {
+    "status": "succeeded",
+    "wall_ms": 5400,
+    "total_cost": { "amount": 0.0112, "currency": "CNY" },
+    "llm_calls": 3,
+    "clarifications": 0,
+    "escalations": 0,
+    "retries": 1,
+    "budget_warned": false,
+    "errors": []
+  },
+  "human_signal": {
+    "verdict": "edited",
+    "edits": [
+      { "field": "category", "from": "其他", "to": "餐饮" }
+    ],
+    "reason": "分类不对",
+    "rework_count": 1,
+    "signal_at": "2026-10-06T12:05:20Z"
+  },
+  "redaction": {
+    "media_retained": false,
+    "media_retention_days": 0,
+    "text_stored": "hashed_summary",
+    "sensitive_fields": ["amount", "merchant"]
+  }
+}

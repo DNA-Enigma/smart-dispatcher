@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://smart-dispatcher.dev/schemas/bookkeeping_merchant.json",
+  "title": "bookkeeping.Merchant",
+  "description": "`normalize_merchant` 的产出：把商户名规范化并归入**用户自己的**分类体系。\n\n分类的取值来自 `ctx.config.categories`（用户配置），不是代码里的常量——替用户决定他怎么记账是错的。",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "merchant": { "type": "string", "description": "规范化后的商户名。" },
+    "category": { "type": "string", "description": "所属分类，取自该用户的分类词表。" }
+  }
+}

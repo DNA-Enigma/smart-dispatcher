@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://smart-dispatcher.dev/schemas/bookkeeping_receipt_fields.json",
+  "title": "bookkeeping.ReceiptFields",
+  "description": "`extract_receipt_fields` 的产出：从票据、支付截图、账单里读出的字段。\n\n**这份形状是从实测反推、再与实现对齐后冻结的**，不是我凭空设计的：消费端（记账 APP）先跑真实任务读 `extract` 节点的 `subtask.completed.output` 得到字段集，这里据实写下。\n\n**amount 一律是主单位的十进制数**（38.5 表示 ¥38.50）。消费端负责把它转成最小单位整数——浮点不能进账本，但契约的这层用十进制更好读、也更好与票据上的印刷数字对照。",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "amount": {
+      "type": ["number", "null"],
+      "description": "金额，主单位十进制（38.5 = ¥38.50）。**读不到时为 null，绝不编造**——金额少读一位会让账目被静默污染。"
+    },
+    "currency": { "type": ["string", "null"], "description": "ISO 4217 代码，如 CNY。小 unit 位数由币种决定，不写死 2。" },
+    "merchant": { "type": ["string", "null"], "description": "商户名，原样保留不规范写法；规范化是 normalize_merchant 的事。" },
+    "datetime": { "type": ["string", "null"], "description": "交易时间，字符串原样。**不强制格式**——票据上的时间格式五花八门，强制解析会在跨境/异形票据上失败。" },
+    "payment_method": { "type": ["string", "null"], "description": "如 微信支付 / 支付宝 / 现金。" },
+    "direction": {
+      "type": ["string", "null"],
+      "enum": ["expense", "income", null],
+      "description": "收支方向。**判不出时必须为 null，不能默认成 expense**——猜错方向等同于把账记反，而用户很难发现。"
+    },
+    "category": { "type": ["string", "null"], "description": "归类，取值应来自该用户的分类词表（`ctx.config.categories`）。" },
+    "confidence": { "type": ["number", "null"], "minimum": 0, "maximum": 1, "description": "抽取置信度。低于策略里 `requires_confirmation_below_confidence` 时任务会停下来问用户，因此这个值要如实给。" },
+    "notes": { "type": ["string", "null"], "description": "其他值得记下的信息。" }
+  }
+}

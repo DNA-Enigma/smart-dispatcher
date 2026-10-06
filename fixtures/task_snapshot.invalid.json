@@ -1,0 +1,17 @@
+{
+  "task_id": "task_bad_snapshot",
+  "tenant_id": "default",
+  "user_id": "u_123",
+  "status": "processing",
+  "source": "api",
+  "mode": "async",
+  "progress": 1.4,
+  "budget": {
+    "max_cost": 0.05,
+    "spent": 0.0078,
+    "currency": "CNY",
+    "enforcement": "advisory"
+  },
+  "created_at": "2026-10-06T12:00:00Z",
+  "updated_at": "2026-10-06T12:00:03.6Z"
+}

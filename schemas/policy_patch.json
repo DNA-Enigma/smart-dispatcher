@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://smart-dispatcher.dev/schemas/policy_patch.json",
+  "title": "PolicyPatch",
+  "description": "建议被批准后生成、并据此产生新 PolicyVersion 的补丁。策略永不原地修改：一律产出新版本，父版本可追溯，因此可即时回滚、可审计，也能回答『这条 run 是哪个策略版本产生的』。",
+  "type": "object",
+  "required": ["patch_id", "base_version", "patches", "approved_by", "approved_at", "scope", "suggestion_id"],
+  "additionalProperties": false,
+  "properties": {
+    "patch_id": { "type": "string" },
+    "suggestion_id": { "type": "string", "description": "来源建议。" },
+    "base_version": { "type": "string", "description": "补丁所基于的策略版本。若当前生效版本已不是它，则补丁拒绝应用并要求重新分析。" },
+
+    "patches": {
+      "type": "array",
+      "minItems": 1,
+      "description": "改动项。op 只支持叶子赋值与数组追加——不支持删除、不支持结构重排，因为这两类操作难以回滚与审计。",
+      "items": {
+        "type": "object",
+        "required": ["op", "artifact", "path", "value"],
+        "additionalProperties": false,
+        "properties": {
+          "op": { "type": "string", "enum": ["set", "append"] },
+          "artifact": {
+            "type": "string",
+            "enum": [
+              "routing.policy.yaml",
+              "taxonomy.yaml",
+              "flow_templates",
+              "prompts/evaluator.md",
+              "prompts/router.md",
+              "prompts/decomposer.md",
+              "handler.schema"
+            ]
+          },
+          "path": { "type": "string" },
+          "previous": { "description": "改动前的值，用于生成审计记录与差异展示。" },
+          "value": {}
+        }
+      }
+    },
+
+    "approved_by": {
+      "type": "string",
+      "description": "审批人标识。这是策略范围的所有者——单用户场景即使用者本人；多人场景为租户所有者。契约中没有 admin 角色。"
+    },
+    "approved_at": { "type": "string", "format": "date-time" },
+    "approval_note": { "type": ["string", "null"] },
+
+    "scope": {
+      "type": "object",
+      "required": ["level"],
+      "additionalProperties": false,
+      "properties": {
+        "level": { "type": "string", "enum": ["user", "tenant", "app"] },
+        "tenant_id": { "type": ["string", "null"] },
+        "user_id": { "type": ["string", "null"] },
+        "canary": {
+          "type": ["object", "null"],
+          "description": "金丝雀配置。单用户场景下按流量比例分片意义有限，此时按时间窗或按路由分片。",
+          "additionalProperties": false,
+          "properties": {
+            "mode": { "type": "string", "enum": ["traffic_ratio", "route_subset", "time_window"] },
+            "ratio": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+            "routes": { "type": ["array", "null"], "items": { "type": "string" } },
+            "duration_ms": { "type": ["integer", "null"], "minimum": 1 }
+          }
+        }
+      }
+    },
+
+    "guardrails": {
+      "type": "object",
+      "description": "金丝雀期间的自动护栏。任一指标相对基线劣化超过 evolution.canary_rollback_margin 即自动回滚到 base_version。",
+      "additionalProperties": false,
+      "properties": {
+        "watched_metrics": { "type": "array", "items": { "type": "string" } },
+        "rollback_margin": { "type": ["number", "null"], "minimum": 0 },
+        "outcome": { "type": ["string", "null"], "enum": ["promoted", "rolled_back", "pending", null] },
+        "observed": { "type": ["object", "null"], "additionalProperties": true }
+      }
+    }
+  }
+}

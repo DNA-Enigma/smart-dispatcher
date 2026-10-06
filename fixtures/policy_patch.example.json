@@ -1,0 +1,34 @@
+{
+  "patch_id": "pp_01J8ZR5C8Y",
+  "suggestion_id": "sg_01J8ZR2T4W",
+  "base_version": "pv_2026-10-01_03",
+  "patches": [
+    {
+      "op": "set",
+      "artifact": "routing.policy.yaml",
+      "path": "routes[direct_answer].when",
+      "previous": "单步、无副作用、不需要外部事实或用户私有数据即可回答的请求（解释、改写、闲聊、常识问答）。",
+      "value": "单步、无副作用、不需要外部事实或用户私有数据即可回答的请求（解释、改写、闲聊、常识问答）。凡涉及查询本人流水、余额、持仓或任何用户私有账目数据，一律不得选择本路由——这类请求必须走需要 handler 的路由。"
+    }
+  ],
+  "approved_by": "u_123",
+  "approved_at": "2026-10-06T09:12:44Z",
+  "approval_note": "确实是漏了一句，改。",
+  "scope": {
+    "level": "user",
+    "tenant_id": "default",
+    "user_id": "u_123",
+    "canary": {
+      "mode": "time_window",
+      "ratio": null,
+      "routes": null,
+      "duration_ms": 86400000
+    }
+  },
+  "guardrails": {
+    "watched_metrics": ["task_failure_rate", "guard_overrule_rate", "human_edit_rate", "budget_warn_rate"],
+    "rollback_margin": 0.05,
+    "outcome": "pending",
+    "observed": null
+  }
+}

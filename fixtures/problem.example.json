@@ -1,0 +1,15 @@
+{
+  "type": "https://smart-dispatcher/errors/unsupported_media",
+  "title": "Unsupported media type",
+  "status": 415,
+  "code": "unsupported_media",
+  "detail": "media_id=m_01J8ZQ3A 声明的 mime 为 image/heic，不在允许列表 [image/png, image/jpeg, image/webp] 内。",
+  "retryable": false,
+  "request_id": "req_01J8ZQ4K2M",
+  "task_id": null,
+  "context": {
+    "media_id": "m_01J8ZQ3A",
+    "declared_mime": "image/heic",
+    "allowed_mime": ["image/png", "image/jpeg", "image/webp"]
+  }
+}

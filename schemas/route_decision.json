@@ -1,0 +1,130 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://smart-dispatcher.dev/schemas/route_decision.json",
+  "title": "RouteDecision",
+  "description": "阶段 02 Router 的输出。由 LLM 在策略菜单中做出选择，再由 PolicyGuard 做无语义的集合校验后产出。guard 块由代码写入，不是 LLM 的输出。",
+  "type": "object",
+  "required": ["decision_version", "policy_version", "route_id", "path", "model_tier", "execution_mode", "decompose", "budget", "rationale", "confidence", "guard"],
+  "additionalProperties": false,
+  "properties": {
+    "decision_version": { "type": "string" },
+    "policy_version": { "type": "string", "description": "做出本决策所依据的策略版本。必须随每条 run log 持久化，否则无法回答『这条 run 是哪个策略产生的』。" },
+
+    "route_id": {
+      "type": "string",
+      "description": "所选路由。取值必须是 config/routing.policy.yaml 中 routes[].id 之一，由 PolicyGuard 校验成员资格——这是配置性词表，故 schema 不设 enum。"
+    },
+    "path": {
+      "type": "string",
+      "enum": ["direct_llm", "single_step_tool", "decompose"],
+      "description": "执行路径。这是结构性词表（实现里对应三种执行器），故在 schema 中封闭。"
+    },
+    "model_tier": {
+      "type": "string",
+      "description": "所选模型档位。取值必须是策略 model_tiers 的键之一，由 PolicyGuard 校验。档位名是配置性的，不是模型名——实现与 handler 都不得出现具体模型标识。"
+    },
+    "vision_tier": {
+      "type": ["string", "null"],
+      "description": "视觉子步骤单独使用的档位；为空表示与 model_tier 相同。"
+    },
+    "handler": {
+      "type": ["string", "null"],
+      "description": "承接本次任务的 handler id。path=direct_llm 时必须为 null。"
+    },
+    "tool_set": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "本次允许调用的工具白名单。必须是所选 handler 已声明 tools 的子集，由 PolicyGuard 取交集校验。"
+    },
+
+    "execution_mode": { "type": "string", "enum": ["sync", "async"] },
+    "decompose": { "type": "boolean", "description": "是否进入拆解阶段。true 时 path 必须为 decompose。" },
+    "parallelism_hint": {
+      "type": ["integer", "null"],
+      "minimum": 1,
+      "description": "建议并发度。这是提示，最终并发度由 ExecutionPlan.max_parallelism 决定。"
+    },
+
+    "budget": {
+      "type": "object",
+      "description": "本任务的成本与时长预算。注意 enforcement 模式来自策略：默认 advisory 表示只记账与告警、不中断执行。",
+      "required": ["max_cost", "max_wall_ms", "max_llm_calls"],
+      "additionalProperties": false,
+      "properties": {
+        "max_cost": { "type": "number", "minimum": 0 },
+        "max_wall_ms": { "type": "integer", "minimum": 1 },
+        "max_llm_calls": { "type": "integer", "minimum": 0 }
+      }
+    },
+
+    "escalation_rule": {
+      "type": ["object", "null"],
+      "description": "升级规则。由确定性代码执行，且 max_escalations 是硬上限——不得由 LLM 决定，否则会成环。",
+      "additionalProperties": false,
+      "properties": {
+        "on": {
+          "type": "array",
+          "items": { "type": "string", "enum": ["schema_validation_failed", "low_quality", "low_confidence", "upstream_error"] }
+        },
+        "to_tier": { "type": "string" },
+        "max_escalations": { "type": "integer", "minimum": 0 }
+      }
+    },
+
+    "rationale": {
+      "type": "string",
+      "maxLength": 400,
+      "description": "LLM 给出的选择理由。必须持久化：04 通过分析 rationale 质量与 guard 推翻率来发现『when 散文已过时』。"
+    },
+    "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+
+    "guard": {
+      "type": "object",
+      "description": "PolicyGuard 的确定性修正记录。由代码写入，LLM 不得产出本字段。每一次修正都要留痕，使『LLM 反复被纠正』成为可观测信号而非隐性问题。",
+      "required": ["applied", "fallback_used"],
+      "additionalProperties": false,
+      "properties": {
+        "applied": {
+          "type": "array",
+          "description": "本次施加的修正项。全部是集合代数或数值截断，不含任何领域语义判断。",
+          "items": {
+            "type": "string",
+            "enum": [
+              "tier_downgraded",
+              "tier_upgraded_health",
+              "tool_set_intersected",
+              "budget_clamped",
+              "route_fallback",
+              "handler_fallback",
+              "mode_promoted"
+            ]
+          }
+        },
+        "original_tier": { "type": ["string", "null"], "description": "被修正前的档位，仅在发生档位修正时非空。" },
+        "original_route_id": { "type": ["string", "null"] },
+        "original_mode": { "type": ["string", "null"], "enum": ["sync", "async", null] },
+        "fallback_used": { "type": "boolean" },
+        "violations": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "LLM 输出被拒的具体原因，如 tool_not_declared_by_handler。"
+        }
+      }
+    },
+
+    "mode_change_reason": {
+      "type": ["string", "null"],
+      "description": "execution_mode 相对请求约束被提升时的说明，如 projected_exceeds_sync_budget。"
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "decompose": { "const": true } }, "required": ["decompose"] },
+      "then": { "properties": { "path": { "const": "decompose" } } }
+    },
+    {
+      "if": { "properties": { "path": { "const": "direct_llm" } }, "required": ["path"] },
+      "then": { "properties": { "handler": { "type": "null" }, "tool_set": { "maxItems": 0 } } }
+    }
+  ]
+}

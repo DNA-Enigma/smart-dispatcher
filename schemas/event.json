@@ -1,0 +1,292 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://smart-dispatcher.dev/schemas/event.json",
+  "title": "Event",
+  "description": "状态流事件。既用于 SSE（GET /v1/tasks/{id}/events），也用于持久化事件日志。事件日志必须带单调递增的 seq，因为它同时是断线重放的游标——移动端退到后台再回来时靠它补齐缺失事件。现有 duowei-ai 的 SSE 是即发即弃、只喂活连接，断线即丢失整轮运行，契约里不得沿用。",
+  "type": "object",
+  "required": ["seq", "task_id", "type", "ts", "data"],
+  "additionalProperties": false,
+  "properties": {
+    "seq": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "任务内单调递增。作为 SSE 的 id 字段下发，客户端用 Last-Event-ID 回传以重放。"
+    },
+    "task_id": { "type": "string" },
+    "type": {
+      "type": "string",
+      "enum": [
+        "task.created",
+        "profile.ready",
+        "route.decided",
+        "plan.ready",
+        "subtask.started",
+        "subtask.progress",
+        "subtask.completed",
+        "subtask.retrying",
+        "subtask.failed",
+        "agent.round",
+        "agent.review",
+        "task.escalated",
+        "token",
+        "budget.warning",
+        "budget.exceeded",
+        "clarification.needed",
+        "task.completed",
+        "task.failed",
+        "task.cancelled",
+        "error",
+        "heartbeat"
+      ]
+    },
+    "ts": { "type": "string", "format": "date-time" },
+    "subtask_id": { "type": ["string", "null"], "description": "与某个子任务相关的事件在此冗余一份 id，便于客户端按节点过滤。" },
+    "data": { "type": "object", "additionalProperties": true }
+  },
+  "allOf": [
+    { "if": { "properties": { "type": { "const": "task.created" } }, "required": ["type"] },
+      "then": { "properties": { "data": { "$ref": "#/$defs/TaskCreated" } } } },
+
+    { "if": { "properties": { "type": { "const": "profile.ready" } }, "required": ["type"] },
+      "then": { "properties": { "data": { "type": "object", "required": ["profile"], "properties": { "profile": { "$ref": "task_profile.json" } } } } } },
+
+    { "if": { "properties": { "type": { "const": "route.decided" } }, "required": ["type"] },
+      "then": { "properties": { "data": { "type": "object", "required": ["decision"], "properties": { "decision": { "$ref": "route_decision.json" } } } } } },
+
+    { "if": { "properties": { "type": { "const": "plan.ready" } }, "required": ["type"] },
+      "then": { "properties": { "data": { "$ref": "#/$defs/PlanReady" } } } },
+
+    { "if": { "properties": { "type": { "const": "subtask.started" } }, "required": ["type"] },
+      "then": { "properties": { "data": { "$ref": "#/$defs/SubtaskStarted" } } } },
+
+    { "if": { "properties": { "type": { "const": "subtask.progress" } }, "required": ["type"] },
+      "then": { "properties": { "data": { "$ref": "#/$defs/SubtaskProgress" } } } },
+
+    { "if": { "properties": { "type": { "const": "subtask.completed" } }, "required": ["type"] },
+      "then": { "properties": { "data": { "$ref": "#/$defs/SubtaskCompleted" } } } },
+
+    { "if": { "properties": { "type": { "const": "subtask.retrying" } }, "required": ["type"] },
+      "then": { "properties": { "data": { "$ref": "#/$defs/SubtaskRetrying" } } } },
+
+    { "if": { "properties": { "type": { "const": "subtask.failed" } }, "required": ["type"] },
+      "then": { "properties": { "data": { "$ref": "#/$defs/SubtaskFailed" } } } },
+
+    { "if": { "properties": { "type": { "const": "agent.round" } }, "required": ["type"] },
+      "then": { "properties": { "data": { "$ref": "#/$defs/AgentRound" } } } },
+
+    { "if": { "properties": { "type": { "const": "agent.review" } }, "required": ["type"] },
+      "then": { "properties": { "data": { "$ref": "#/$defs/AgentReview" } } } },
+
+    { "if": { "properties": { "type": { "const": "task.escalated" } }, "required": ["type"] },
+      "then": { "properties": { "data": { "$ref": "#/$defs/TaskEscalated" } } } },
+
+    { "if": { "properties": { "type": { "const": "token" } }, "required": ["type"] },
+      "then": { "properties": { "data": { "type": "object", "required": ["token"], "properties": { "token": { "type": "string" } } } } } },
+
+    { "if": { "properties": { "type": { "enum": ["budget.warning", "budget.exceeded"] } }, "required": ["type"] },
+      "then": { "properties": { "data": { "$ref": "#/$defs/Budget" } } } },
+
+    { "if": { "properties": { "type": { "const": "clarification.needed" } }, "required": ["type"] },
+      "then": { "properties": { "data": { "$ref": "#/$defs/ClarificationNeeded" } } } },
+
+    { "if": { "properties": { "type": { "const": "task.completed" } }, "required": ["type"] },
+      "then": { "properties": { "data": { "$ref": "#/$defs/TaskCompleted" } } } },
+
+    { "if": { "properties": { "type": { "const": "task.failed" } }, "required": ["type"] },
+      "then": { "properties": { "data": { "type": "object", "required": ["error"], "properties": { "error": { "$ref": "problem.json" } } } } } },
+
+    { "if": { "properties": { "type": { "const": "task.cancelled" } }, "required": ["type"] },
+      "then": { "properties": { "data": { "type": "object", "required": ["by"], "properties": { "by": { "type": "string" } } } } } },
+
+    { "if": { "properties": { "type": { "const": "error" } }, "required": ["type"] },
+      "then": { "properties": { "data": { "type": "object", "required": ["problem"], "properties": { "problem": { "$ref": "problem.json" } } } } } }
+  ],
+  "$defs": {
+    "Money": {
+      "type": "object",
+      "required": ["amount", "currency"],
+      "additionalProperties": false,
+      "properties": {
+        "amount": { "type": "number", "minimum": 0 },
+        "currency": { "type": "string" }
+      }
+    },
+    "TaskCreated": {
+      "type": "object",
+      "required": ["task_id", "mode"],
+      "additionalProperties": false,
+      "properties": {
+        "task_id": { "type": "string" },
+        "mode": { "type": "string", "enum": ["sync", "async"] },
+        "mode_changed": { "type": "boolean" },
+        "estimated": { "type": ["object", "null"], "additionalProperties": true }
+      }
+    },
+    "PlanReady": {
+      "type": "object",
+      "required": ["strategy", "source", "node_count"],
+      "additionalProperties": false,
+      "properties": {
+        "strategy": { "type": "string", "enum": ["single_step", "dag"] },
+        "source": { "type": "string" },
+        "node_count": { "type": "integer", "minimum": 1 },
+        "max_parallelism": { "type": ["integer", "null"], "minimum": 1 },
+        "revision": { "type": ["integer", "null"], "minimum": 1 }
+      }
+    },
+    "SubtaskStarted": {
+      "type": "object",
+      "required": ["subtask_id", "attempt"],
+      "additionalProperties": false,
+      "properties": {
+        "subtask_id": { "type": "string" },
+        "name": { "type": ["string", "null"] },
+        "attempt": { "type": "integer", "minimum": 1 },
+        "tier": { "type": ["string", "null"] },
+        "tool": { "type": ["string", "null"] }
+      }
+    },
+    "SubtaskProgress": {
+      "type": "object",
+      "required": ["subtask_id", "progress"],
+      "additionalProperties": false,
+      "properties": {
+        "subtask_id": { "type": "string" },
+        "progress": { "type": "number", "minimum": 0, "maximum": 1 },
+        "message": { "type": ["string", "null"] }
+      }
+    },
+    "SubtaskCompleted": {
+      "type": "object",
+      "required": ["subtask_id"],
+      "additionalProperties": false,
+      "properties": {
+        "subtask_id": { "type": "string" },
+        "output": { "type": ["object", "null"], "additionalProperties": true },
+        "cost": { "oneOf": [{ "$ref": "#/$defs/Money" }, { "type": "null" }] },
+        "latency_ms": { "type": ["integer", "null"], "minimum": 0 },
+        "escalated_from": { "type": ["string", "null"] }
+      }
+    },
+    "SubtaskRetrying": {
+      "type": "object",
+      "required": ["subtask_id", "attempt", "next_backoff_ms"],
+      "additionalProperties": false,
+      "properties": {
+        "subtask_id": { "type": "string" },
+        "attempt": { "type": "integer", "minimum": 1 },
+        "next_backoff_ms": { "type": "integer", "minimum": 0 },
+        "error": { "type": ["object", "null"], "additionalProperties": true }
+      }
+    },
+    "SubtaskFailed": {
+      "type": "object",
+      "required": ["subtask_id", "error", "on_failure_applied"],
+      "additionalProperties": false,
+      "properties": {
+        "subtask_id": { "type": "string" },
+        "error": { "type": "object", "required": ["code", "retryable"], "additionalProperties": true },
+        "on_failure_applied": { "type": "string", "enum": ["fail_task", "skip", "continue_with_default"] }
+      }
+    },
+    "AgentRound": {
+      "type": "object",
+      "description": "agent 类型节点每完成一轮循环上报一次。轮内发生的工具调用本身由各工具的 subtask.progress / tool 事件描述；本事件只刻画『这一轮想干什么、结果如何、为什么停』。",
+      "required": ["subtask_id", "round", "max_rounds"],
+      "additionalProperties": false,
+      "properties": {
+        "subtask_id": { "type": "string" },
+        "role": { "type": ["string", "null"] },
+        "round": { "type": "integer", "minimum": 1 },
+        "max_rounds": { "type": "integer", "minimum": 1 },
+        "tool_calls": {
+          "type": ["array", "null"],
+          "items": { "type": "string" },
+          "description": "本轮调用过的工具名，按顺序。"
+        },
+        "stop_reason": {
+          "type": ["string", "null"],
+          "enum": ["output_satisfied_schema", "no_more_actions", "round_limit", "repeated_no_progress", "aborted", null]
+        },
+        "tier": { "type": ["string", "null"] }
+      }
+    },
+    "AgentReview": {
+      "type": "object",
+      "description": "独立复核的进展与结论。仅在节点声明了 verification 时出现。",
+      "required": ["subtask_id", "reviewers", "outcome"],
+      "additionalProperties": false,
+      "properties": {
+        "subtask_id": { "type": "string" },
+        "mode": { "type": "string", "enum": ["self_check", "independent_review"] },
+        "reviewers": { "type": "integer", "minimum": 1 },
+        "agreement": {
+          "type": ["number", "null"],
+          "minimum": 0,
+          "maximum": 1,
+          "description": "各独立复核者在关键字段上的一致程度。低一致度本身就是一个值得上报的信号。"
+        },
+        "outcome": { "type": "string", "enum": ["unanimous", "arbitrated", "undecidable", "escalated_to_user"] },
+        "arbiter_role": { "type": ["string", "null"] },
+        "dissenting_fields": { "type": ["array", "null"], "items": { "type": "string" } }
+      }
+    },
+    "TaskEscalated": {
+      "type": "object",
+      "required": ["from_tier", "to_tier", "reason"],
+      "additionalProperties": false,
+      "properties": {
+        "from_tier": { "type": "string" },
+        "to_tier": { "type": "string" },
+        "reason": { "type": "string" },
+        "subtask_id": { "type": ["string", "null"] },
+        "escalation_index": { "type": ["integer", "null"], "minimum": 1 }
+      }
+    },
+    "Budget": {
+      "type": "object",
+      "required": ["scope", "spent", "limit"],
+      "additionalProperties": false,
+      "properties": {
+        "scope": { "type": "string", "enum": ["task", "user_daily", "tenant_daily"] },
+        "spent": { "type": "number", "minimum": 0 },
+        "limit": { "type": "number", "minimum": 0 },
+        "spent_ratio": { "type": ["number", "null"], "minimum": 0 },
+        "currency": { "type": ["string", "null"] },
+        "enforcement": { "type": ["string", "null"], "enum": ["advisory", "hard", null] }
+      }
+    },
+    "ClarificationNeeded": {
+      "type": "object",
+      "required": ["question_id", "question", "blocking"],
+      "additionalProperties": false,
+      "properties": {
+        "question_id": { "type": "string" },
+        "question": { "type": "string" },
+        "options": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "label"],
+            "additionalProperties": false,
+            "properties": { "id": { "type": "string" }, "label": { "type": "string" } }
+          }
+        },
+        "blocking": { "type": "boolean" },
+        "resume_url": { "type": ["string", "null"] }
+      }
+    },
+    "TaskCompleted": {
+      "type": "object",
+      "required": ["task_id", "status"],
+      "additionalProperties": false,
+      "properties": {
+        "task_id": { "type": "string" },
+        "status": { "type": "string", "enum": ["succeeded"] },
+        "result": { "type": ["object", "null"], "additionalProperties": true },
+        "artifacts": { "type": ["object", "null"], "additionalProperties": true },
+        "cost": { "oneOf": [{ "$ref": "#/$defs/Money" }, { "type": "null" }] }
+      }
+    }
+  }
+}

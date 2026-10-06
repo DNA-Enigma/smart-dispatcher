@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://smart-dispatcher.dev/schemas/bookkeeping_ledger_entry.json",
+  "title": "bookkeeping.LedgerEntry",
+  "description": "`build_ledger_entry` 的产出：**一份待入账的凭证草稿**，不是已写入的账目。\n\n> **这个工具以前叫 `write_ledger_entry`，名字是错的。** handler 跑在后端，而账本在消费端的本地库里（手机上的 Room）——后端的工具**不可能**写进用户手机的数据库。改名的同时把语义写清楚，否则下一个读契约的人还会以为它真的在写账。\n\n**为什么是单式而不是复式**：消费端的账本是复式的（`JournalDraft` 构造即校验：至少两条分录、同币种、金额之和为零），但**科目表在消费端**——后端不知道\"餐饮\"该记到哪个账户，它没有那份科目体系。\n\n把复式结构放到这里，等于要么把科目表同步到后端（多一份真源，会分叉），要么在后端再造一套映射（与消费端逻辑重复）。所以：**单式过网，复式留在消费端**。\"支出 = 借费用／贷资产\"这层映射只存在一个地方。\n\n**金额为什么是十进制而不是最小单位整数**：消费端内部一律用最小单位整数（浮点记账必错），但**每种货币有几位小数是消费端才知道的事**（人民币 2 位、日元 0 位、第纳尔 3 位，来自 `java.util.Currency`）。契约传十进制，消费端用自己的 `Money.parse` 转整数——同样是\"别把领域知识复制到第二处\"。",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["entry_id", "amount", "currency", "direction"],
+  "properties": {
+    "entry_id": {
+      "type": "string",
+      "description": "由 `ctx.idempotency_token`（按 `(task_id, subtask_id)` 派生、稳定）推出。消费端把它作为落库的主键或唯一约束，**重试就不会重复入账**。"
+    },
+    "amount": {
+      "type": "number",
+      "description": "金额，主单位十进制（38.5 = ¥38.50）。消费端转最小单位整数。"
+    },
+    "currency": { "type": "string", "description": "ISO 4217 代码。小数位数由消费端按币种决定。" },
+    "direction": {
+      "type": "string",
+      "enum": ["expense", "income"],
+      "description": "收支方向。**必填**：方向是复式映射的输入，缺了消费端无法决定借贷方向。"
+    },
+    "category": { "type": ["string", "null"], "description": "分类，取自该用户的分类词表。消费端据此选费用/收入账户。" },
+    "merchant": { "type": ["string", "null"] },
+    "occurred_at": { "type": ["string", "null"], "description": "交易时间原样字符串，不做格式强制。" },
+    "source_task": { "type": "string", "description": "产生它的任务 id，便于从一笔账回溯到当时的截图与决策。" },
+    "note": { "type": ["string", "null"] }
+  }
+}

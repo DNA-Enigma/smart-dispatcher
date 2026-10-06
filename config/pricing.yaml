@@ -1,0 +1,63 @@
+# =============================================================================
+# 价格表
+# =============================================================================
+# 由运营维护，价格来自供应商，不是可以"学"出来的东西，因此在 routing.policy.yaml
+# 的 locked_paths 中列为 pricing.*，04 自进化永远不能修改本文件。
+#
+# 本文件的作用是让成本估算保持"LLM 出量级、代码做算术"的分工：
+# 01 评估器只输出 input_tokens_bucket / output_tokens_bucket 这样的量级桶，
+# 金额由确定性代码查这张表相乘得出。LLM 不擅长算术，擅长判断"这活看着不小"。
+# =============================================================================
+
+pricing_version: "v3"
+currency: CNY
+updated_at: "2026-09-20"
+
+# 单价的分母。写出来而不是在代码里写 1000——换一个计费单位（有些供应商按百万
+# token 计价）时应当只改这里。
+unit: per_1k_tokens
+unit_divisor: 1000
+
+# 单价与 routing.policy.yaml 的 model_tiers.*.price_per_1k 保持一致；
+# 两侧不一致时以本文件为准，并在启动时告警。
+
+# 单价为元 / 1k token（国内定价）。来源：MiMo 开放平台 定价与限速。
+#
+# 注意 **推理 token 按输出计费**：MiMo 的深度思考默认开启，思考产生的
+# reasoning_tokens 计入 completion_tokens。因此开启思考时实际输出成本会明显高于
+# 非思考模式，成本估算要把这部分算进去——否则估算会系统性偏低。
+#
+# 两个档位落在同一个模型上（平台只有两个通用文本模型可用，见 .env 的说明），
+# 所以 cheap 与 standard 是同一组单价。
+models:
+  cheap:                 # mimo-v2.6-flash
+    in: 0.001
+    out: 0.002
+  standard:              # 同 flash
+    in: 0.001
+    out: 0.002
+  strong:                # mimo-v2.6-pro
+    in: 0.003
+    out: 0.006
+
+# 量级桶 → token 数的折算。用于把 LLM 给出的桶换成可相乘的数字。
+# 取桶的上界做估算，使 est_cost.max 是一个偏保守（偏高）的值。
+token_buckets:
+  xs: 200
+  s: 1500
+  m: 6000
+  l: 24000
+  xl: 96000
+
+# 非 LLM 成本的折算，用于工具调用与媒体处理。
+tools:
+  default_per_call: 0.0
+  vision_ocr_per_image:
+    cheap: 0.002
+    standard: 0.006
+    strong: 0.018
+media:
+  storage_per_mb_day: 0.0001
+
+# 估算说明，会原样写进 TaskProfile.est_cost.basis，便于事后核对估算偏差。
+basis_template: "pricing.yaml@{pricing_version}"

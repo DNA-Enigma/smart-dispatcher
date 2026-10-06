@@ -1,0 +1,184 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://smart-dispatcher.dev/schemas/task_profile.json",
+  "title": "TaskProfile",
+  "description": "阶段 01 TaskEvaluator 的输出。对请求的结构化画像。注意：本对象只描述请求，不含路由选择，也不含任何执行结果。",
+  "type": "object",
+  "required": ["profile_version", "task_type", "modality", "complexity", "urgency", "required_capabilities", "recommended_mode", "confidence", "degraded"],
+  "additionalProperties": false,
+  "properties": {
+    "profile_version": { "type": "string", "description": "本 schema 的版本，与契约同步演进。" },
+    "policy_version": { "type": ["string", "null"], "description": "产出本画像时所依据的策略版本。" },
+
+    "task_type": {
+      "type": "string",
+      "description": "任务类型。取值必须来自 config/taxonomy.yaml 的定义。这是配置性词表，故 schema 不设 enum——由实现按当前 taxonomy 校验，未命中则回落到 taxonomy.fallback_type 并记 taxonomy_miss 指标（该指标是 04 提出『词表缺项』建议的依据）。"
+    },
+    "intent_summary": { "type": "string", "description": "一句话复述用户想做什么，供人审阅与 rationale 分析。" },
+    "modality": {
+      "type": "array",
+      "items": { "type": "string", "enum": ["text", "image", "audio", "pdf"] },
+      "minItems": 1
+    },
+
+    "complexity": {
+      "type": "object",
+      "description": "复杂度由 LLM 打分（判断题），分数到档位的切分由代码按 thresholds.complexity_band_cutoffs 做纯查表。",
+      "required": ["score"],
+      "additionalProperties": false,
+      "properties": {
+        "score": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "0 表示一次模型调用即可完成，1 表示多步、多来源、存在真实依赖。"
+        },
+        "band": {
+          "type": "string",
+          "enum": ["low", "medium", "high"],
+          "description": "由**代码**按 thresholds.complexity_band_cutoffs 从 score 派生，实现应覆盖 LLM 给出的值（若给了）。不要求 LLM 输出本字段——让模型同时给分数和档位，只会引入两者不一致的可能，而档位是纯查表的结果，不需要判断。"
+        },
+        "reasons": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "urgency": {
+      "type": "object",
+      "required": ["level"],
+      "additionalProperties": false,
+      "properties": {
+        "level": { "type": "string", "enum": ["low", "normal", "high"] },
+        "reasons": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+
+    "vision": {
+      "type": ["object", "null"],
+      "description": "存在图像输入时的视觉需求画像。",
+      "additionalProperties": false,
+      "properties": {
+        "required": { "type": "boolean" },
+        "image_roles": { "type": "array", "items": { "type": "string" } },
+        "expected_extraction": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "期望抽取的字段名，如 amount / merchant / datetime / payment_method。"
+        }
+      }
+    },
+
+    "candidate_capabilities": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "按可能性排序的能力候选，取值来自已注册 handler 声明的 capabilities（注册表是评估器的输入之一，这就是插件接缝）。"
+    },
+    "required_capabilities": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "完成本任务必须具备的能力。若无任何 handler 满足，任务以 no_capability_match 拒绝。"
+    },
+    "data_sensitivity": {
+      "type": ["string", "null"],
+      "enum": ["public", "internal", "personal", "financial", null]
+    },
+
+    "estimated_scale": {
+      "type": "object",
+      "description": "LLM 只出量级桶，不做算术；金额由代码乘 config/pricing.yaml 得出。",
+      "additionalProperties": false,
+      "properties": {
+        "input_tokens_bucket": { "type": "string", "enum": ["xs", "s", "m", "l", "xl"] },
+        "output_tokens_bucket": { "type": "string", "enum": ["xs", "s", "m", "l", "xl"] },
+        "est_tool_calls": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "est_cost": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "currency": { "type": "string" },
+        "min": { "type": "number", "minimum": 0 },
+        "max": { "type": "number", "minimum": 0 },
+        "basis": { "type": "string", "description": "估算依据，如 pricing.yaml@v3。" }
+      }
+    },
+    "est_latency_ms": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "min": { "type": "integer", "minimum": 0 },
+        "max": { "type": "integer", "minimum": 0 }
+      }
+    },
+
+    "recommended_mode": { "type": "string", "enum": ["sync", "async"] },
+
+    "needs_clarification": { "type": "boolean" },
+    "clarification": {
+      "type": ["object", "null"],
+      "description": "needs_clarification=true 时必填。这是正常交互路径而非异常：记账场景中『这是支出还是收入』必须问清楚，不能猜。",
+      "required": ["question", "blocking"],
+      "additionalProperties": false,
+      "properties": {
+        "question": { "type": "string" },
+        "options": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "label"],
+            "additionalProperties": false,
+            "properties": {
+              "id": { "type": "string" },
+              "label": { "type": "string" }
+            }
+          }
+        },
+        "blocking": { "type": "boolean", "description": "true 表示任务停在此处等待答复，不继续执行。" },
+        "partial_profile": { "type": ["object", "null"], "additionalProperties": true, "description": "已确定的部分画像，答复后与其合并。" }
+      }
+    },
+
+    "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+    "degraded": {
+      "type": "boolean",
+      "description": "true 表示评估器未能正常完成（超时 / JSON 修复失败），当前画像来自 fallback_profile_id。降级不阻断任务，但会记入 run log 供 04 观察回退率。"
+    },
+
+    "profile_cache": {
+      "type": ["object", "null"],
+      "description": "画像缓存命中信息。相似度判定由 LLM 完成，不得用写死的阈值比较文本。",
+      "additionalProperties": false,
+      "properties": {
+        "hit": { "type": "boolean" },
+        "key": { "type": ["string", "null"] },
+        "source_task_id": { "type": ["string", "null"] },
+        "similarity": { "type": ["number", "null"], "minimum": 0, "maximum": 1 }
+      }
+    },
+
+    "evaluator": {
+      "type": ["object", "null"],
+      "description": "本次评估调用自身的观测数据，用于成本归属与 04 的延迟分析。",
+      "additionalProperties": false,
+      "properties": {
+        "tier": { "type": "string", "description": "评估所用档位，默认取策略 evaluator.tier。" },
+        "model_resolved": { "type": ["string", "null"], "description": "实际解析到的模型标识，仅用于观测，不对外承诺。" },
+        "escalated_from": { "type": ["string", "null"], "description": "非空表示经过了双档升级：先极小档判断信息不足，再升到标准档重评。" },
+        "latency_ms": { "type": "integer", "minimum": 0 },
+        "tokens": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "properties": {
+            "in": { "type": "integer", "minimum": 0 },
+            "out": { "type": "integer", "minimum": 0 }
+          }
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "needs_clarification": { "const": true } }, "required": ["needs_clarification"] },
+      "then": { "required": ["clarification"], "properties": { "clarification": { "type": "object" } } }
+    }
+  ]
+}

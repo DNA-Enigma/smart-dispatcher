@@ -1,0 +1,102 @@
+# =============================================================================
+# 任务类型词表
+# =============================================================================
+# 01 评估器只能从这里的类型中选。它是一份封闭清单，因为：
+#   1. 词表如果开放，04 就无法统计"词表缺项"——而缺项恰恰是最有价值的一类建议；
+#   2. 类型名会进入 RunLog 与 04 的聚合指标，必须稳定可比。
+#
+# 词表可被 04 以 taxonomy_add 建议的形式追加（只增不改不删）。当 taxonomy_miss
+# 指标升高时，系统会提出"这个词表缺了一类意图"。
+#
+# 命名约定：<domain>.<verb_phrase>，全小写下划线，domain 对应 handler_id。
+# =============================================================================
+
+taxonomy_version: "1.0"
+
+# 评估器无法归类时的落点。该值同时被 policy.fallback.profile_id 引用。
+fallback_type: generic.unknown
+
+types:
+  # ---- 通识与轻交互 ----
+  - id: chat.smalltalk
+    domain: chat
+    description: 闲聊、问候、情绪表达，无任务诉求。
+  - id: chat.explain
+    domain: chat
+    description: 解释概念、改写文字、翻译、总结，不需要用户私有数据。
+  - id: chat.advice
+    domain: chat
+    description: 征求建议或意见，回答依赖通用知识即可。
+
+  # ---- 记账 ----
+  - id: bookkeeping.capture_from_receipt
+    domain: bookkeeping
+    description: 从票据、支付截图、账单等图像中抽取字段并记录一笔往来。
+    typical_modality: [image, text]
+    sensitivity: financial
+  - id: bookkeeping.capture_from_text
+    domain: bookkeeping
+    description: 用户用纯文字描述一笔收支（如"中午吃饭38"），需记账但无需视觉抽取。
+    typical_modality: [text]
+    sensitivity: financial
+  - id: bookkeeping.ledger.query
+    domain: bookkeeping
+    description: 查询账目、统计收支、"我这个月花了多少"。
+    typical_modality: [text]
+    sensitivity: financial
+  - id: bookkeeping.reconciliation
+    domain: bookkeeping
+    description: 对账、核对账单与实际流水、查找差异。
+    typical_modality: [text, image]
+    sensitivity: financial
+  - id: bookkeeping.report
+    domain: bookkeeping
+    description: 生成周期性的收支报表、结构分析。
+    typical_modality: [text]
+    sensitivity: financial
+  - id: bookkeeping.budget_plan
+    domain: bookkeeping
+    description: 制定或调整预算、给出节流建议，需要历史流水作为依据。
+    typical_modality: [text]
+    sensitivity: financial
+  - id: bookkeeping.investment.position
+    domain: bookkeeping
+    description: 记录或查询投资持仓、收益、成本。
+    typical_modality: [text, image]
+    sensitivity: financial
+  - id: bookkeeping.investment.analysis
+    domain: bookkeeping
+    description: 分析持仓结构、风险敞口、与基准对比。
+    typical_modality: [text]
+    sensitivity: financial
+  - id: bookkeeping.plan.advice
+    domain: bookkeeping
+    description: 结合收支与持仓给出财务规划建议。
+    typical_modality: [text]
+    sensitivity: financial
+
+  # ---- 日程 ----
+  - id: calendar.create_event
+    domain: calendar
+    description: 新建日程、提醒、待办。
+    typical_modality: [text]
+  - id: calendar.query
+    domain: calendar
+    description: 查询某段时间的安排、空闲时间。
+    typical_modality: [text]
+  - id: calendar.reschedule
+    domain: calendar
+    description: 改期、取消、调整已有日程。
+    typical_modality: [text]
+
+  # ---- 通用 ----
+  - id: document.extract
+    domain: document
+    description: 从文档或图片中抽取结构化信息，但不写入任何账本或日程。
+    typical_modality: [image, pdf]
+  - id: generic.unknown
+    domain: generic
+    description: 无法归入以上任何一类。出现频率升高即意味着词表需要扩充。
+
+# 04 在提出 taxonomy_add 建议时，须给出这些字段的完整取值，缺一不可。
+add_suggestion_required_fields: [id, domain, description, typical_modality]

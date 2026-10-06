@@ -1,0 +1,144 @@
+# =============================================================================
+# Agent 角色注册表
+# =============================================================================
+# 这张表定义了"多 Agent 协作"里到底有哪些角色。它是配置，不是代码——
+# 新增一个角色 = 在这里加一段，再加一个提示词文件。
+#
+# 与 duowei-ai 现有做法的关键区别：
+#   现有：9 个 Agent 的拓扑写死在 core/graph.py 里（N1→N2→batch→batch2），
+#         每个 Agent 的职责与工具用 Python 常量和 GROUP_TEMPLATES 硬编码。
+#   本设计：角色在这里声明，**拓扑由 03 拆解器动态生成**（DAG），
+#         角色只回答"这个位置由谁来做"，不回答"它后面接谁"。
+#
+# 角色声明里永不出现模型名，只出现能力需求（requires）。这是"禁止硬编码模型"
+# 在 Agent 层的落点：角色说"我需要视觉能力"，档位由调度层映射。
+# =============================================================================
+
+agents_version: "1.0"
+
+# -----------------------------------------------------------------------------
+# 协作的总原则（写给拆解器与仲裁者看的，也是本设计的边界声明）
+# -----------------------------------------------------------------------------
+collaboration_principles: >
+  Agent 之间**不自由对话**。它们通过结构化的数据依赖协作：上游节点的输出按 $ref
+  绑定到下游节点的输入，冲突由明确的仲裁角色裁决，全过程落在事件日志里。
+
+  这样做而不是让 Agent 互相聊天，是因为自由对话式的多 Agent 有两个无法回避的问题：
+  成本与延迟没有上界（对话轮数不受控），以及过程难以观测与复现（无法回答"它当时
+  为什么那么说"）。用 DAG + 有类型输出 + 仲裁者，同样能表达协作，但每一步都可边界、
+  可审计、可回放。
+
+  需要"多方案竞争"时，用 nodes[].verification 的 independent_review，而不是让
+  Agent 辩论——前者是固定 N 份独立产出 + 一个仲裁者，成本与轮数都是常数。
+
+# -----------------------------------------------------------------------------
+# 角色
+# -----------------------------------------------------------------------------
+roles:
+  # ---- 通用角色 ----
+  - id: planner
+    when: >
+      需要把一个目标分解成有序步骤、或需要在执行中途根据已获得的信息重新规划时。
+    system_prompt_ref: prompts/agents/planner.md
+    allowed_tools: []                 # 规划者只思考，不接触外部事实
+    requires: [text]
+    default_tier: standard
+    max_rounds: 2
+    output_must_satisfy_schema: true
+
+  - id: researcher
+    when: >
+      需要从多个来源收集信息、反复检索并在信息足够时收敛结论时。
+    system_prompt_ref: prompts/agents/researcher.md
+    allowed_tools: []                 # 由具体 handler 在节点上收窄
+    requires: [text]
+    default_tier: standard
+    max_rounds: 6
+    output_must_satisfy_schema: true
+
+  - id: verifier
+    when: >
+      需要独立复核另一份产出的正确性。它必须独立取数，不得复用被复核者的中间结论。
+    system_prompt_ref: prompts/agents/verifier.md
+    allowed_tools: []
+    requires: [text]
+    default_tier: strong              # 复核比生产更需要判断力，值得用更强的档位
+    max_rounds: 3
+    output_must_satisfy_schema: true
+
+  - id: arbiter
+    when: >
+      多份独立产出出现分歧、需要裁决时。它必须能给出"无法裁决"，而不是被迫选一个。
+    system_prompt_ref: prompts/agents/arbiter.md
+    allowed_tools: []
+    requires: [text]
+    default_tier: strong
+    max_rounds: 1
+    output_must_satisfy_schema: true
+
+  # ---- 记账领域角色 ----
+  - id: receipt_extractor
+    when: >
+      需要从票据、支付截图、账单图像中抽取结构化字段。当图像质量差、字段可能散落
+      多处、或需要放大局部再看一次时，用本角色而不是单次工具调用。
+    system_prompt_ref: prompts/agents/receipt_extractor.md
+    allowed_tools: [extract_receipt_fields, crop_and_zoom, read_media_region]
+    requires: [vision.extract, text]
+    default_tier: standard
+    max_rounds: 4
+    output_must_satisfy_schema: true
+    # 轮数耗尽时不要接受残缺产出——记账场景缺字段比慢更糟。
+    on_round_limit: escalate_and_retry
+
+  - id: merchant_classifier
+    when: >
+      需要把商户名归到用户自己的分类体系里。当商户名不规范、可能是连锁品牌的不同
+      门店、或需要结合用户历史归类习惯时，用本角色。纯查表能命中时不需要。
+    system_prompt_ref: prompts/agents/merchant_classifier.md
+    allowed_tools: [lookup_merchant, query_ledger, list_categories]
+    requires: [text]
+    default_tier: cheap
+    max_rounds: 3
+
+  - id: ledger_auditor
+    when: >
+      需要核对已入账的记录与原始凭证是否一致，或需要在多笔记录之间找出矛盾。
+      典型用于对账与周期性复核。
+    system_prompt_ref: prompts/agents/ledger_auditor.md
+    allowed_tools: [query_ledger, read_media_region, compare_entries]
+    requires: [text, vision.extract]
+    default_tier: strong
+    max_rounds: 8
+    # 复核类角色轮数耗尽时应给出部分结论，而不是整体失败——
+    # 一份"发现 3 处存疑、另有 5 笔未能核对"的报告仍然有价值。
+    on_round_limit: accept_partial
+
+# -----------------------------------------------------------------------------
+# 各领域的默认评审配置。节点未显式声明 verification 时按此处的 task_type 匹配。
+# 默认全部为 none：验证会成倍增加成本，必须显式开启。
+# -----------------------------------------------------------------------------
+verification_defaults:
+  - applies_to_task_types: ["bookkeeping.*"]
+    mode: none
+    note: >
+      记账的默认防线不是多 Agent 交叉验证，而是让用户在确认页核对（见 flow_templates
+      的 confirmation 段）。人工确认比机器复核更准，也更便宜。仅当某类抽取被 04
+      检测出人工改单率长期偏高时，才考虑对那一步开启 independent_review。
+
+  - applies_to_task_types: ["bookkeeping.reconciliation", "bookkeeping.investment.analysis"]
+    mode: independent_review
+    reviewers: 2
+    reviewer_role: verifier
+    arbiter_role: arbiter
+    on_disagreement: ask_user
+    max_cost_multiplier: 3.0
+    note: >
+      对账与投资分析的结论错了，用户很难事后发现，且代价高，所以值得开交叉验证。
+      分歧无法裁决时问用户，而不是强行选一个。
+
+# 硬界。这些值受 routing.policy.yaml 的 limits.* 再约束，取更小者。
+hard_bounds:
+  max_rounds_ceiling: 8
+  max_reviewers_ceiling: 3
+  # 同一任务内所有 agent 节点的轮数总和上限。防止"每步都合规但整体炸掉"。
+  max_total_rounds_per_task: 40

@@ -1,0 +1,191 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://smart-dispatcher.dev/schemas/task_snapshot.json",
+  "title": "TaskSnapshot",
+  "description": "GET /v1/tasks/{task_id} 的响应。字段刻意对齐 ai-workmate/app/lib/data/task_repo.dart 的词汇（TaskStatus / TaskStepStatus / progress = 终态节点数 ÷ 总节点数），使 Flutter 侧的任务看板可 1:1 映射而不需要新控件。",
+  "type": "object",
+  "required": ["task_id", "user_id", "status", "source", "mode", "progress", "created_at", "updated_at"],
+  "additionalProperties": false,
+  "properties": {
+    "task_id": { "type": "string" },
+    "tenant_id": { "type": "string" },
+    "user_id": { "type": "string" },
+    "parent_task_id": { "type": ["string", "null"] },
+
+    "status": {
+      "type": "string",
+      "description": "任务状态。awaiting_clarification 是正常状态而非异常路径。rejected 与 failed 的区别在于：rejected 表示守卫无法产出合法决策，什么都没跑。",
+      "enum": [
+        "received",
+        "evaluating",
+        "routing",
+        "planning",
+        "running",
+        "awaiting_clarification",
+        "escalated",
+        "succeeded",
+        "failed",
+        "cancelled",
+        "budget_exceeded",
+        "rejected"
+      ]
+    },
+    "source": {
+      "type": "string",
+      "enum": ["manual", "chat", "scheduled", "api"],
+      "description": "任务来源，对应 task_repo.dart 的 TaskSource。"
+    },
+    "title": { "type": ["string", "null"], "description": "面向用户的标题，由评估摘要生成。" },
+    "subtitle": { "type": ["string", "null"], "description": "如『记账 · 票据录入』。" },
+
+    "progress": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "description": "= 终态节点数 ÷ 总节点数。与 task_repo.dart 的计算方式一致。"
+    },
+    "mode": { "type": "string", "enum": ["sync", "async"] },
+    "mode_changed": { "type": "boolean", "default": false },
+    "mode_change_reason": { "type": ["string", "null"] },
+
+    "profile": {
+      "description": "阶段 01 输出；未完成时为 null。",
+      "oneOf": [{ "$ref": "task_profile.json" }, { "type": "null" }]
+    },
+    "decision": {
+      "description": "阶段 02 输出；未完成时为 null。",
+      "oneOf": [{ "$ref": "route_decision.json" }, { "type": "null" }]
+    },
+    "plan": {
+      "description": "阶段 03 输出的计划与逐节点执行状态。",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["strategy", "revision", "nodes"],
+          "additionalProperties": false,
+          "properties": {
+            "strategy": { "type": "string", "enum": ["single_step", "dag"] },
+            "revision": { "type": "integer", "minimum": 1 },
+            "source": { "type": ["string", "null"] },
+            "max_parallelism": { "type": ["integer", "null"], "minimum": 1 },
+            "nodes": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["subtask_id", "status", "progress", "attempts"],
+                "additionalProperties": false,
+                "properties": {
+                  "subtask_id": { "type": "string" },
+                  "name": { "type": ["string", "null"] },
+                  "status": {
+                    "type": "string",
+                    "enum": ["pending", "ready", "running", "retrying", "succeeded", "failed", "skipped", "cancelled", "defaulted"]
+                  },
+                  "progress": { "type": "number", "minimum": 0, "maximum": 1 },
+                  "attempts": { "type": "integer", "minimum": 0 },
+                  "tier": { "type": ["string", "null"] },
+                  "started_at": { "type": ["string", "null"], "format": "date-time" },
+                  "ended_at": { "type": ["string", "null"], "format": "date-time" },
+                  "cost": { "oneOf": [{ "$ref": "#/$defs/Money" }, { "type": "null" }] },
+                  "output_preview": { "type": ["object", "null"], "additionalProperties": true },
+                  "error": { "oneOf": [{ "$ref": "#/$defs/NodeFailure" }, { "type": "null" }] }
+                }
+              }
+            }
+          }
+        },
+        { "type": "null" }
+      ]
+    },
+
+    "artifacts": {
+      "type": ["object", "null"],
+      "additionalProperties": true,
+      "description": "终态成功时的产物。失败或被取消时保留部分产物并如实上报——已抽取出的票据字段即使未能入账也有价值。"
+    },
+    "budget": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "max_cost": { "type": "number", "minimum": 0 },
+        "spent": { "type": "number", "minimum": 0 },
+        "currency": { "type": "string" },
+        "max_wall_ms": { "type": "integer", "minimum": 1 },
+        "elapsed_ms": { "type": "integer", "minimum": 0 },
+        "enforcement": {
+          "type": "string",
+          "enum": ["advisory", "hard"],
+          "description": "advisory：只记账与告警，从不中断执行（默认）。hard：超出上限时中断并置为 budget_exceeded。该模式来自策略，不由调用方决定。"
+        },
+        "warned": { "type": "boolean", "default": false }
+      }
+    },
+    "clarification": {
+      "oneOf": [{ "$ref": "#/$defs/PendingClarification" }, { "type": "null" }]
+    },
+    "error": { "oneOf": [{ "$ref": "problem.json" }, { "type": "null" }] },
+
+    "policy_version": { "type": ["string", "null"] },
+    "created_at": { "type": "string", "format": "date-time" },
+    "updated_at": { "type": "string", "format": "date-time" },
+    "ended_at": { "type": ["string", "null"], "format": "date-time" },
+
+    "links": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "events_url": { "type": ["string", "null"] },
+        "result_url": { "type": ["string", "null"] }
+      }
+    }
+  },
+  "$defs": {
+    "Money": {
+      "type": "object",
+      "required": ["amount", "currency"],
+      "additionalProperties": false,
+      "properties": {
+        "amount": { "type": "number", "minimum": 0 },
+        "currency": { "type": "string" }
+      }
+    },
+    "NodeFailure": {
+      "type": "object",
+      "description": "有类型的节点失败。禁止把多个错误拼成一个字符串（现有 duowei-ai core/graph.py 用 '; ' 拼接异常即反例）。",
+      "required": ["code", "retryable"],
+      "additionalProperties": false,
+      "properties": {
+        "code": { "type": "string" },
+        "message": { "type": ["string", "null"] },
+        "retryable": { "type": "boolean" },
+        "subtask_id": { "type": ["string", "null"] },
+        "on_failure_applied": { "type": ["string", "null"] },
+        "attempts": { "type": ["integer", "null"], "minimum": 0 }
+      }
+    },
+    "PendingClarification": {
+      "type": "object",
+      "required": ["question_id", "question", "blocking"],
+      "additionalProperties": false,
+      "properties": {
+        "question_id": { "type": "string" },
+        "question": { "type": "string" },
+        "options": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "label"],
+            "additionalProperties": false,
+            "properties": {
+              "id": { "type": "string" },
+              "label": { "type": "string" }
+            }
+          }
+        },
+        "blocking": { "type": "boolean" },
+        "asked_at": { "type": ["string", "null"], "format": "date-time" },
+        "expires_at": { "type": ["string", "null"], "format": "date-time", "description": "超时未答复时的处置由策略指定（默认按 blocking=false 继续或按默认选项继续）。" }
+      }
+    }
+  }
+}

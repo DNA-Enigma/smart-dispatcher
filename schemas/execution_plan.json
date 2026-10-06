@@ -1,0 +1,199 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://smart-dispatcher.dev/schemas/execution_plan.json",
+  "title": "ExecutionPlan",
+  "description": "阶段 03 Decomposer 的输出：一个待执行的 DAG。可以由具名 flow_template 参数化生成，也可以由 LLM 自由拆解生成；两者都必须通过同一套确定性校验（无环、依赖存在、工具属于 handler 白名单、join 与入边一致、预算之和不超决策预算）。",
+  "type": "object",
+  "required": ["plan_version", "task_id", "strategy", "nodes", "edges", "plan_budget", "max_parallelism", "revision"],
+  "additionalProperties": false,
+  "properties": {
+    "plan_version": { "type": "string" },
+    "task_id": { "type": "string" },
+    "strategy": {
+      "type": "string",
+      "enum": ["single_step", "dag"],
+      "description": "single_step 时 nodes 恰好一个且无依赖边。"
+    },
+    "source": {
+      "type": "string",
+      "description": "计划来源，形如 flow_template:<id> 或 llm_decomposition。模板未命中率是 04 提出『该加模板了』建议的依据。"
+    },
+    "max_parallelism": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "并发上限。必须来自计划本身，不得使用实现里的模块级常量（现有 duowei-ai core/graph.py 的 MAX_CONCURRENT_AGENTS = 9 即反例）。"
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "重规划计数。上限由策略 decomposer.max_replans 硬约束。"
+    },
+    "nodes": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/Node" }
+    },
+    "edges": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["from", "to"],
+        "additionalProperties": false,
+        "properties": {
+          "from": { "type": "string" },
+          "to": { "type": "string" }
+        }
+      }
+    },
+    "join": {
+      "type": "object",
+      "description": "汇聚点：子任务 id → 必须全部完成的前驱集合。集合内容必须与该节点入边完全一致（确定性校验项）。",
+      "additionalProperties": { "type": "array", "items": { "type": "string" } }
+    },
+    "plan_budget": {
+      "type": "object",
+      "required": ["max_cost", "max_wall_ms", "max_llm_calls"],
+      "additionalProperties": false,
+      "properties": {
+        "max_cost": { "type": "number", "minimum": 0 },
+        "max_wall_ms": { "type": "integer", "minimum": 1 },
+        "max_llm_calls": { "type": "integer", "minimum": 0 }
+      }
+    }
+  },
+  "$defs": {
+    "Node": {
+      "type": "object",
+      "description": "一个子任务节点。有两种执行者：executor=tool 是一次确定性工具调用；executor=agent 是一个带角色、带工具白名单、有界多轮循环的自主执行者。选择哪种由拆解器判断，并由确定性校验约束在配置允许的范围内——需要多轮试探与判断的步骤用 agent，需要确定结果的步骤用 tool。",
+      "required": ["subtask_id", "handler", "depends_on", "executor"],
+      "additionalProperties": false,
+      "properties": {
+        "subtask_id": { "type": "string", "description": "计划内唯一。同时作为 $ref 的命名空间。" },
+        "name": { "type": "string", "description": "面向用户的步骤名，直接显示在任务看板上。" },
+        "handler": { "type": "string" },
+
+        "executor": {
+          "type": "string",
+          "enum": ["tool", "agent"],
+          "description": "tool：单次调用该工具，产出确定。agent：以某个角色循环调用若干工具直到产出满足 schema 就停止，或触及轮数上限而失败。"
+        },
+        "tool": {
+          "type": "string",
+          "description": "executor=tool 时必填，为唯一要调用的工具名。必须是该 handler 已声明 tools 之一，由确定性校验按集合成员判定——LLM 幻觉出的工具名在此被拒。"
+        },
+        "role": {
+          "type": ["string", "null"],
+          "description": "executor=agent 时必填，取值来自 config/agents.yaml 的 roles[].id。角色决定系统提示词、可用工具子集、起始档位与轮数上限。契约里不出现模型名，角色只声明能力需求。"
+        },
+        "tool_whitelist": {
+          "type": ["array", "null"],
+          "items": { "type": "string" },
+          "description": "executor=agent 时可被该 agent 调用的工具子集，必须 ⊆ 角色的 allowed_tools，且 ⊆ 决策的 tool_set。两级白名单取交集，任一为空则节点计划非法。"
+        },
+        "max_rounds": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "description": "executor=agent 时的循环轮数上限。取 角色的 max_rounds 与 limits.max_agent_rounds 的较小者——这是硬界，不允许无界循环。"
+        },
+        "depends_on": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "前驱子任务 id。空数组表示可立即就绪。"
+        },
+        "inputs": {
+          "type": "object",
+          "description": "参数绑定。值可以是字面量，也可以是 {\"$ref\": \"extract.amount\"} 形式的引用；引用目标为 envelope.* / task.artifacts.* / <subtask_id>.<field>。解析失败是确定性错误，与 LLM 无关。",
+          "additionalProperties": true
+        },
+        "output_schema_ref": {
+          "type": ["string", "null"],
+          "description": "本节点输出的 schema 名。必须可解析；节点输出不满足该 schema 时按节点失败处理，并可触发档位升级。"
+        },
+        "model_tier": {
+          "type": ["string", "null"],
+          "description": "本节点使用的档位；null 表示继承决策的 model_tier。纯算术工具应为 null 且 required_capabilities 为空——不该走 LLM 就不走。"
+        },
+        "required_capabilities": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "本节点需要的模型能力，如 vision.extract。handler 用它替代模型名，这是『禁止硬编码模型』在结构上的强制点。"
+        },
+        "timeout_ms": { "type": ["integer", "null"], "minimum": 1 },
+        "retry": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "properties": {
+            "max": { "type": "integer", "minimum": 0 },
+            "backoff_ms": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "idempotent": {
+          "type": "boolean",
+          "default": false,
+          "description": "true 时调度层为该节点注入稳定的 idempotency_token（按 task_id + subtask_id 派生），保证重试不会重复写入。"
+        },
+        "optional": { "type": "boolean", "default": false },
+        "on_round_limit": {
+          "type": ["string", "null"],
+          "enum": ["fail_task", "accept_partial", "escalate_and_retry", null],
+          "description": "executor=agent 且轮数耗尽时的处置。escalate_and_retry 会升档重跑，但仍受 max_escalations 硬界约束。"
+        },
+
+        "verification": {
+          "type": ["object", "null"],
+          "description": "多 Agent 交叉验证配置。默认关闭——它会成倍增加成本与延迟，因此必须显式声明，且只在结论错了代价高、结果又难以事后发现的步骤上开启。",
+          "additionalProperties": false,
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": ["none", "self_check", "independent_review"],
+              "description": "none 不校验；self_check 让同一执行者自查一遍（便宜，但自我确认偏差大）；independent_review 起 N 个相互独立的执行者，再由仲裁者比对裁决。"
+            },
+            "reviewers": {
+              "type": ["integer", "null"],
+              "minimum": 2,
+              "description": "mode=independent_review 时的独立执行次数。取 配置的 reviewers 与 limits.max_reviewers 的较小者。"
+            },
+            "reviewer_role": {
+              "type": ["string", "null"],
+              "description": "复核者使用的角色；为空则与主执行者同角色，但各自独立取数、不共享中间状态。"
+            },
+            "arbiter_role": {
+              "type": ["string", "null"],
+              "description": "仲裁者角色。它拿到 N 份产出与各自的依据，负责裁决或指出无法裁决。仲裁者同样只能从配置的角色中选。"
+            },
+            "on_disagreement": {
+              "type": ["string", "null"],
+              "enum": ["arbiter_decides", "ask_user", "fail_task", null],
+              "description": "裁决者认为无法裁决时的处置。ask_user 会转为 awaiting_clarification——这在记账场景中往往比强行选一个更好。"
+            },
+            "max_cost_multiplier": {
+              "type": ["number", "null"],
+              "minimum": 1,
+              "description": "本节点允许因验证而膨胀的成本倍数上限。计划校验时用它检查是否超出决策预算。"
+            }
+          }
+        },
+
+        "on_failure": {
+          "type": "string",
+          "enum": ["fail_task", "skip", "continue_with_default"],
+          "description": "节点永久失败后的处置。非 optional 节点应使用 fail_task。"
+        },
+        "default_output": {
+          "description": "on_failure=continue_with_default 时使用。"
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "executor": { "const": "tool" } }, "required": ["executor"] },
+          "then": { "required": ["tool"], "properties": { "role": { "type": "null" }, "tool_whitelist": { "type": "null" }, "verification": { "type": "null" } } }
+        },
+        {
+          "if": { "properties": { "executor": { "const": "agent" } }, "required": ["executor"] },
+          "then": { "required": ["role"], "properties": { "tool": { "type": "null" } } }
+        }
+      ]
+    }
+  }
+}

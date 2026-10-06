@@ -1,0 +1,375 @@
+# =============================================================================
+# 路由策略 —— 决策表本身
+# =============================================================================
+# 这份文件不是配置的"某一部分"，它就是决策表。routes[].when 那段散文是给 LLM
+# 读的判定依据：LLM 读菜单、做选择，代码只做集合校验（见 PolicyGuard）。
+#
+# 新增一条路由 = 在这里追加一段 YAML。不需要改代码，不需要新增 if 分支。
+#
+# 本文件可由 04 Self-Evolve 提出修改建议，但必须经使用者本人批准后才会以新的
+# policy_version 生效；locked_paths 下的内容永不可改。
+# =============================================================================
+
+policy_version: "pv_2026-10-01_03"
+schema_version: "1.0"
+
+# -----------------------------------------------------------------------------
+# 自进化禁区。命中此处的建议在入库前被确定性校验丢弃，不会呈现给使用者。
+# -----------------------------------------------------------------------------
+locked_paths:
+  # 模型与供应商的绑定关系：改错了会静默换掉用户实际在用的模型，且泄露密钥引用结构。
+  - "model_tiers.*.provider"
+  - "model_tiers.*.model_ref"
+  # 兜底路由：这是"系统出问题时还能跑"的最后一道保障，不能让系统自己调它。
+  - "fallback"
+  # 资源与安全的硬边界。
+  - "limits.*"
+  # Agent 协作的硬界（单节点轮数、复核份数、总轮数上限）。
+  # 角色自身的 max_rounds 可在 limits 之内调整，但这三条界不可动。
+  - "agents.*.hard_bounds"
+  # 进化机制自身的参数：不允许自我放宽。
+  - "evolution.*"
+  # 价格表由运营维护，价格来自供应商，不是可以"学"出来的东西。
+  - "pricing.*"
+
+# -----------------------------------------------------------------------------
+# 模型档位。契约里只出现档位名，永不出现具体模型标识。
+# handler 通过 ctx.llm(messages, requires=["vision.extract"]) 请求能力，
+# 由调度层把能力映射到档位、把档位映射到实际模型。这是"禁止硬编码模型"
+# 在结构上的强制点：handler 连模型名字符串都拿不到。
+#
+# capabilities 与工具声明的 requires_capabilities 是**同一套词表**，
+# 因此"这个档位能否满足这个需求"是一次纯子集测试（⊇），没有映射表、没有语义判断。
+# 解析规则：在路由的 allowed_tiers 里，取序数最小（最便宜）且能力集合
+# 覆盖全部需求的档位；找不到就是 no_capability_match。
+#
+# 强度需求也表达为能力名（reasoning.strong），而不是"档位名"——
+# 这样工具只说"我需要强推理"，不说"我要 strong 档"，档位划分变化时工具不用改。
+#
+# **档位在本文件里的书写顺序即由便宜到贵。** 解析器取"第一个满足需求的"，
+# 也就是"最便宜的满足需求的"。想改变成本策略就重排这里的顺序——
+# 那是数据改动，不是代码改动。mean_tier_index 检测器也用这个顺序把档位名映射成序数。
+# -----------------------------------------------------------------------------
+model_tiers:
+  cheap:
+    provider: xiaomi_mimo
+    model_ref: "secret://llm/cheap_model"
+    capabilities: [text, json_mode]
+    context_window: 1048576          # 1M
+    price_per_1k: { in: 0.001, out: 0.002 }   # 元 / 1k token
+
+  standard:
+    provider: xiaomi_mimo
+    model_ref: "secret://llm/standard_model"
+    capabilities: [text, json_mode, vision.extract, tool_calling]
+    context_window: 1048576
+    price_per_1k: { in: 0.001, out: 0.002 }
+
+  strong:
+    provider: xiaomi_mimo
+    model_ref: "secret://llm/strong_model"
+    capabilities: [text, json_mode, vision.extract, tool_calling, reasoning.strong, long_context]
+    context_window: 1048576
+    price_per_1k: { in: 0.003, out: 0.006 }
+
+# -----------------------------------------------------------------------------
+# 路由表。
+#
+# 字段说明：
+#   when          给 LLM 读的适用条件（散文）。这是决策表的核心内容。
+#   path          结构性取值，只能是 direct_llm / single_step_tool / decompose。
+#   default_tier  该路由的默认档位。
+#   allowed_tiers 允许的档位集合；LLM 选了集合外的档位会被降级到 default_tier。
+#   requires_handler  该路由是否必须落到某个 handler 上。
+#   evaluate      declared_authoritative 为 true 时，本路由是否允许跳过 01 评估。
+#   max_cost      该路由的成本参考上限。是否中断由 budget.enforcement 决定。
+#   mode          建议的执行模式；sync 在投影超时后会被提升为 async。
+#   mode          sync 是优化，async 是基底。
+# -----------------------------------------------------------------------------
+routes:
+  - id: direct_answer
+    when: >
+      单步、无副作用、不需要外部事实、也不需要任何用户私有数据即可回答的请求
+      （解释、改写、闲聊、常识问答、语言翻译）。
+      凡涉及查询本人流水、余额、持仓、日程等用户私有数据，一律不得选择本路由——
+      这类请求必须走需要 handler 的路由。
+    path: direct_llm
+    default_tier: cheap
+    allowed_tiers: [cheap, standard]
+    requires_handler: false
+    evaluate: always
+    max_cost: 0.003
+    mode: sync
+
+  - id: single_tool_action
+    when: >
+      意图单一且明确，最多需要一次工具调用即可完成。包含写操作也算，
+      只要该步骤不依赖其他步骤的产出。
+      若需要先看清图片内容再决定写什么，则不属于本路由。
+      判断依据：**这个工具的必填参数，能不能一次从原话里填出来。**
+      能，就是本路由；有任一必填参数需要先经过另一次调用才能得到，就不是——
+      那种情况中间存在真实依赖，应选 multi_step_analysis。
+      务必给出 tool_set：本路由必须有一个具体的工具，否则无法执行。
+    path: single_step_tool
+    default_tier: standard
+    allowed_tiers: [cheap, standard]
+    requires_handler: true
+    evaluate: always
+    tool_policy: handler_authorized_subset
+    max_cost: 0.02
+    mode: sync
+
+  - id: vision_extract_then_write
+    when: >
+      输入包含票据、支付截图、账单、发票、合同照片等图像，需要先做视觉字段抽取，
+      再把结构化的结果写入用户的账本、日程或资料库。
+      允许在抽取与写入之间穿插查重、归类等无副作用的步骤。
+      若图中内容仅用于回答一个问题而无需持久化，应选 direct_answer。
+    path: decompose
+    default_tier: standard
+    vision_tier: standard
+    allowed_tiers: [standard, strong]
+    requires_handler: true
+    evaluate: always
+    tool_policy: handler_authorized_subset
+    flow_template_hint: receipt_to_entry
+    max_cost: 0.08
+    mode: async
+    # 抽取置信度低于此值时先问用户，不猜。这是记账场景最重要的一条策略。
+    requires_confirmation_below_confidence: 0.75
+
+  - id: multi_step_analysis
+    when: >
+      多步任务，且步骤之间存在真实依赖，或需要综合多个来源、多次工具往返
+      才能得出结论（例如"分析我这三个月的支出结构并给出下月预算建议"）。
+      典型情形：某个工具的必填参数需要先由另一次调用产出——
+      例如"明天下午三点开会"要先把相对时间解析成绝对时间才能建日程；
+      "把这笔消费记一下"要先查重才能安全入账。
+      步骤之间没有依赖、可以各自独立完成时，不应选本路由。
+      本路由不必给出 tool_set：拆解阶段会决定用哪些工具。
+    path: decompose
+    default_tier: standard
+    allowed_tiers: [standard, strong]
+    requires_handler: true
+    evaluate: always
+    tool_policy: handler_authorized_subset
+    max_cost: 0.50
+    mode: async
+
+  - id: scheduled_aggregate
+    when: >
+      由定时器触发的周期性汇总、对账、报表任务（日报、周报、月报、账单核对）。
+      判断依据是本请求的 source 为 scheduled，而非内容。
+    path: decompose
+    default_tier: standard
+    allowed_tiers: [standard, strong]
+    requires_handler: true
+    evaluate: always
+    tool_policy: handler_authorized_subset
+    max_cost: 0.20
+    mode: async
+
+# -----------------------------------------------------------------------------
+# 阈值。所有数值阈值集中在这里，代码里不得出现字面量。
+# -----------------------------------------------------------------------------
+thresholds:
+  # LLM 给出复杂度分，代码只做纯查表把它切成档。
+  complexity_band_cutoffs: { low: 0.33, high: 0.66 }
+  complexity_band_tier_map: { low: cheap, medium: standard, high: strong }
+
+  # 置信度阈值。
+  clarify_below: 0.55            # 低于此值 → needs_clarification
+  escalate_below_confidence: 0.60
+  escalation_tiers: { cheap: standard, standard: strong, strong: strong }
+  max_escalations: 1             # 硬上限，由代码执行，不受 LLM 影响，防止成环
+
+  # 评估器画像缓存的相似度下限。相似度由 LLM 判定，这里只放一个可调的门槛。
+  profile_cache_similarity_min: 0.90
+  profile_cache_ttl_s: 3600
+
+# -----------------------------------------------------------------------------
+# 成本。
+#
+# enforcement.mode 默认 advisory：完整记账、超过 warn_at_ratio 时告警，但
+# 永不在执行中打断任务。这是当前的明确选择——先在真实使用中攒出成本数据，
+# 让 04 依据数据提出阈值建议，而不是一开始就用一个拍脑袋的数字硬拦。
+# 需要硬拦时把 mode 改成 hard 即可，无需改代码。
+# -----------------------------------------------------------------------------
+budget:
+  enforcement:
+    mode: advisory               # advisory | hard
+    applies_to: [task, user_daily, tenant_daily]
+  per_task_default: 0.05
+  per_user_daily: 5.00
+  per_tenant_daily: 50.00
+  warn_at_ratio: 0.8
+  currency: CNY
+
+# -----------------------------------------------------------------------------
+# 兜底。策略或评估器出问题时走这里，并在决策中标记 fallback_used=true。
+# fallback 本身列在 locked_paths 中，不可被自进化修改。
+# -----------------------------------------------------------------------------
+fallback:
+  route_id: single_tool_action
+  tier: standard
+  on: [router_invalid_output, router_timeout, router_low_confidence, evaluator_degraded]
+  profile_id: generic_unknown
+
+# -----------------------------------------------------------------------------
+# 01 评估器。每次都跑——但跑在最便宜的档位上。
+# 信息不足以做决策时先由极小档自判，再升级到标准档重评（双档）。
+# -----------------------------------------------------------------------------
+evaluator:
+  tier: cheap
+  # **实测值，不是猜的。** MiMo 上 6 次真实请求的中位延迟 2.27s、p90 2.49s、
+  # 最慢 18.2s（上游偶发抖动）。这里给 3.5 倍中位数的余量。
+  #
+  # 教训值得记下来：这两个超时值最初是我在没有任何真实延迟数据时填的
+  # （1200ms / 2000ms），比实测中位数还小。后果不是"报错"，而是**每一次路由都
+  # 悄悄走兜底**——13 个请求里 12 个的"路由决策"其实是一次超时，
+  # 而外部看起来完全正常。超时值必须实测。
+  timeout_ms: 8000
+  max_repair_attempts: 1
+  requires: [text]
+  # 供应商参数透传。调度层代码不认识这些键，只是从配置里读出来放进请求体——
+  # 于是"某个供应商有个开关"这件事留在配置里，不渗进代码。
+  #
+  # 这里关掉深度思考，理由有三条，每一条都具体：
+  #   1. 当前供应商的深度思考**默认开启，且会强制 temperature 与 top_p 取其推荐值**
+  #      —— 于是"我传了 temperature=0 所以可复现"这个假设会静默失效；
+  #   2. 评估是分类任务，慢思考换不来多少准确率；
+  #   3. 思考产生的 reasoning token **按输出计费**，白花钱。
+  options:
+    thinking: { type: disabled }
+  # 双档：先极小档自判"信息够不够"，不够才升级。升级次数上限防止反复重评。
+  escalation:
+    enabled: true
+    to_tier: standard
+    max_escalations: 1
+    on: [insufficient_information, schema_validation_failed, timeout]
+  # 相似请求复用画像。相似度判定由 LLM 完成，不得用写死的字符串比较。
+  cache:
+    enabled: true
+    ttl_s: 3600
+    similarity_min: 0.90
+    key_fields: [modality, data_sensitivity, declared, text_length_bucket, media_count]
+
+# -----------------------------------------------------------------------------
+# 02 路由器。
+# -----------------------------------------------------------------------------
+router:
+  tier: cheap                  # 选路由是选择题，不需要强模型
+  # 实测：中位 2.72s、p90 5.58s、最慢 12.0s。路由器的提示词比评估器大
+  # （菜单 + 工具目录 + 硬约束），因此余量也给它更多。
+  timeout_ms: 12000
+  max_repair_attempts: 1
+  temperature: 0               # 路由要可复现、可审计
+  persist_rationale: true      # rationale 与 policy_version 必须一并落库
+  # 关掉深度思考——这里的理由比评估器更强：**路由必须可复现**。
+  # 开着思考时供应商会把 temperature 强制成它自己的推荐值，于是上面那个 0 形同虚设，
+  # 而一个不可复现的路由决策没法审计，也没法做金丝雀对比。
+  options:
+    thinking: { type: disabled }
+
+# -----------------------------------------------------------------------------
+# 03 拆解与执行。
+# -----------------------------------------------------------------------------
+decomposer:
+  tier: standard
+  max_replans: 1               # 重规划硬上限
+  # 是否允许把节点声明为 agent（多轮自主执行者）而非单次工具调用。
+  # 关闭时所有节点都必须是 executor=tool，角色表整体失效。
+  agents:
+    enabled: true
+    # 拆解器据以下两点决定用 agent 还是 tool，写成散文是因为判定者是 LLM：
+    #   use_agent_when  —— 需要多轮试探、需要中途看结果再决定下一步的步骤
+    #   use_tool_when   —— 结果由确定性输入唯一决定、一次调用即可的步骤
+    # 判错的代价不对称：把 tool 步骤写成 agent 只是浪费成本（有 max_agent_nodes
+    # 与轮数上限兜底），把 agent 步骤写成 tool 会产不出结果。因此倾向可偏向 agent，
+    # 但硬界必须夹住。
+    use_agent_when: >
+      该步骤需要先看到中间结果才能决定下一步做什么（例如先看清票据清晰度再决定是否
+      放大局部重看）、或需要在多处之间反复查找比对才能得出结论。
+    use_tool_when: >
+      该步骤的输入确定则输出唯一，一次调用即可完成，不需要根据中间结果调整策略
+      （例如按 media_id 查重、按已定字段写库、纯算术汇总）。
+  parallel:
+    default_max_parallelism: 3
+    # 上限同时受 limits.max_parallelism 约束（取更小者）
+    max_parallelism_ceiling: 8
+  # **这些默认值以前从来没被读过**——字段在配置里、在模型里声明着，
+  # 但没有任何代码去读它。之所以没暴露出问题，只是因为模板给每个节点都显式写了
+  # timeout 与 retry，一旦有人依赖默认值就会踩空。（同类的静默失效见
+  # docs/08-config-model.md 的 no-orphan-config。）
+  node_defaults:
+    timeout_ms: 15000
+    retry: { max: 1, backoff_ms: 500 }
+    # 节点执行同样要关掉深度思考。这里是**实测出来的**：开着的时候一次视觉抽取跑了
+    # 31.7 秒（模板给的 timeout 是 20 秒），下游商户归类又撞上 8 秒超时——
+    # 抽取结果完全正确却被整单丢掉。抽取与归类都不是推理密集型任务，
+    # 思考只贡献延迟和按输出计费的 reasoning token。
+    options:
+      thinking: { type: disabled }
+  # 汇聚点等待全部前驱；任一前驱永久失败且标记 fail_task 时终止整个任务。
+  join_policy: all_or_fail
+  # 拆解是真正需要推理的环节（判断依赖关系、选模板、定并发），
+  # 因此这里**不关**深度思考——它是唯一一个思考可能换回质量的阶段。
+  # 代价是 token 与延迟，M3 接执行器时用真实数据衡量值不值。
+  options: {}
+
+# -----------------------------------------------------------------------------
+# 硬边界。安全与资源约束，任何情况下不可被 LLM 输出或自进化突破。
+# -----------------------------------------------------------------------------
+limits:
+  sync_timeout_ms: 8000
+  # 异步任务的默认墙钟上限。同步有 sync_timeout_ms 兜底，异步也必须有一个界——
+  # 否则"没有上限"就等于"可能挂到天荒地老"。调用方给出的 max_wall_ms 与它取更小者。
+  default_task_wall_ms: 120000
+  max_parallelism: 8
+  max_replans: 1
+  max_escalations: 1
+  # Agent 类节点的硬界。角色声明的 max_rounds 会被这里再夹一次，取更小者。
+  # 这三条是"多 Agent 不会失控"的保证：单节点轮数、复核份数、整任务总轮数。
+  max_agent_rounds: 8
+  max_reviewers: 3
+  max_total_rounds_per_task: 40
+  # 一个任务里 agent 类型节点的数量上限。防止拆解器把每一步都变成 agent。
+  max_agent_nodes_per_plan: 6
+  media:
+    # 必须是**供应商真正能读的**格式，不是"看起来合理"的格式。
+    # 之前这里还列着 image/heic——那是我凭印象加的，而当前供应商只支持
+    # JPEG / PNG / GIF / WebP / BMP，heic 传上去会在模型那一跳才失败。
+    # 上传期就按供应商能力拒绝，比让一张图走完全程才报错便宜得多。
+    allowed_mime: [image/jpeg, image/png, image/webp]
+    max_bytes: 10485760
+    inline_max_bytes: 262144
+  sse_heartbeat_ms: 15000
+  memory_events: 5000
+
+# -----------------------------------------------------------------------------
+# 04 自进化。全部参数都在这里，且本段整体不可被自进化修改。
+# -----------------------------------------------------------------------------
+evolution:
+  enabled: true
+  analysis_interval: "0 3 * * *"
+  analysis_window: "7d"
+  min_sample_size: 30
+  max_delta_ratio: 0.5          # 单次建议的数值变化幅度上限
+  max_suggestions_per_pass: 5
+  # 分析用哪一档。分析要在指标之上做归因，比"选路由"难，但比"拆解"容易；
+  # 用 standard 是权衡——strong 能给出更好的归因，但每次分析都要读几十条日志。
+  analysis_tier: standard
+  # 交给 LLM 的运行日志抽样条数上限。给全量既贵又没必要：
+  # 检测器已经把"哪里不对"筛出来了，抽样只是为了让归因有具体例子可看。
+  sample_limit: 40
+  retention:
+    media_retained: false       # 金融原始截图默认不留存
+    text_stored: hashed_summary
+    run_log_days: 180
+  canary:
+    enabled: true
+    mode: time_window           # 单用户场景下按流量分片意义有限
+    duration_ms: 86400000
+    rollback_margin: 0.05
+  # 分析提示词自身锁定，不允许自我修改。
+  locked_prompts: [evolution_analysis.md]

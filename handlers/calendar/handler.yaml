@@ -1,0 +1,63 @@
+# =============================================================================
+# 日程 handler 的声明 —— 示例
+# =============================================================================
+# 同 bookkeeping.yaml：示例清单，不是契约，也不是实现。
+#
+# 它存在还有一个额外用途：**验证"不需要模型的路径"**。日程的绝大多数操作是
+# 确定性的（解析时间、查空闲、写记录），能力需求全为空。把这份清单放进来，
+# 就等于把"能力需求为空的工具不会被配模型"这条纪律也纳入了 M1 的验证范围。
+# =============================================================================
+
+handler_id: calendar
+version: "0.1.0"
+
+capabilities:
+  - calendar.create_event
+  - calendar.query
+  - calendar.reschedule
+
+flows: []
+
+required_ports: [store]
+
+tools:
+  - name: create_event
+    description: 新建一条日程或提醒。start 必须是已解析好的绝对时间。
+    side_effects: write
+    requires_capabilities: []
+    idempotent: true
+    input_schema:
+      type: object
+      required: [title, start]
+      properties:
+        title: { type: string, description: 日程标题 }
+        start: { type: string, description: ISO 8601 绝对时间；相对时间请先用 parse_natural_time }
+        duration_minutes: { type: integer }
+
+  - name: query_free_busy
+    description: 查询某段时间内的空闲时段。纯查表。
+    side_effects: read
+    requires_capabilities: []
+    idempotent: true
+
+  - name: reschedule_event
+    description: 调整已有日程的时间。
+    side_effects: write
+    requires_capabilities: []
+    idempotent: true
+
+  - name: parse_natural_time
+    description: >
+      把"明天下午三点""下周三上午"这类说法解析成绝对时间。
+      标了 text 能力，因为它确实需要理解自然语言——时间解析的歧义
+      （下周三是哪个周三、下午三点是 15 点还是 3 点）不适合用规则表穷举。
+    side_effects: none
+    requires_capabilities: [text]
+    idempotent: true
+
+config_schema:
+  type: object
+  properties:
+    default_duration_minutes: { type: integer, minimum: 1 }
+    default_reminder_minutes: { type: integer, minimum: 0 }
+    working_hours: { type: object }

@@ -1,0 +1,164 @@
+# =============================================================================
+# 流程模板：票据 → 账目
+# =============================================================================
+# 模板是具名、参数化、预先校验过的 DAG，用来固化"形状已知"的流程。
+# 存在的理由：票据入账的形状是确定的，不应该每次请求都让 LLM 重新拆一遍——
+# 那既费 token，又会在同一个形状上反复产生小幅幻觉（顺序变化、多加一个节点）。
+#
+# 模板是数据不是代码：新增一个模板 = 加一个 YAML 文件，调度层一行都不用改。
+# 模板未命中率升高时，04 会提出 flow_template_add 建议。
+#
+# 模板由 handler 随附，因此在 07-handler-seam.md 的注册契约里声明。
+# =============================================================================
+
+template_id: receipt_to_entry
+version: "2.0"
+handler: bookkeeping
+
+# 命中条件：由 03 拆解器判定。这里是给 LLM 读的散文，不是关键词列表。
+applies_when: >
+  输入中含有一张主要作为凭证的图像（票据、支付截图、账单、发票），
+  且任务目的是从图中抽取金额等信息并记录为一笔往来。
+  若图像只是顺带提供上下文而任务实质是回答问题，则不适用。
+  若一次性上传多张互相独立的凭证，也不适用（应改用批量模板）。
+
+applies_to_capabilities:
+  - bookkeeping.expense.record
+  - bookkeeping.income.record
+
+inputs:
+  - name: media_ref
+    required: true
+    description: 凭证图像的 media_id。
+  - name: text_hint
+    required: false
+    description: 用户同时附带的文字，可能包含金额或用途的补充说明。
+  - name: user_config
+    required: true
+    description: 该用户的记账配置（币种、分类词表、确认阈值）。
+
+# -----------------------------------------------------------------------------
+# 节点图。
+#
+# 每个节点声明 executor：
+#   agent —— 带角色、带工具白名单、有界多轮循环的自主执行者。用于需要"先看到中间
+#            结果再决定下一步"的步骤。角色定义见 config/agents.yaml。
+#   tool  —— 单次确定性工具调用。用于输入确定则输出唯一、不需要中途调整策略的步骤。
+#
+# 这里刻意混用两种：抽取和归类需要判断与试探，查重和写库不需要。
+# =============================================================================
+
+nodes:
+  # ---- agent：需要多轮。图糊了要能放大局部重看，字段散落要能分区域找。 ----
+  - id: extract
+    name: 抽取票据字段
+    executor: agent
+    role: receipt_extractor
+    tool_whitelist: [extract_receipt_fields, crop_and_zoom, read_media_region]
+    requires: [vision.extract, text]
+    tier: vision                    # 使用决策中的 vision_tier
+    max_rounds: 4
+    on_round_limit: escalate_and_retry
+    depends_on: []
+    # 数据流绑定。$ref 的命名空间：envelope.*（原始请求）、<subtask_id>.*（上游产出）。
+    # 少了这一段，节点会拿到一组空参数——任务照样"成功"，但写进去的东西是空的。
+    inputs:
+      media_ref: { $ref: "envelope.input.media[0].media_id" }
+      text_hint: { $ref: "envelope.input.text" }
+    output_schema_ref: bookkeeping.ReceiptFields
+    timeout_ms: 20000
+    retry: { max: 1, backoff_ms: 500 }
+    idempotent: true
+    on_failure: fail_task
+    # 默认关闭多 Agent 交叉验证。开启会让本步成本约乘 3，因此只有在该用户的
+    # 人工改单率被 04 检测出长期偏高时，才值得对这一步打开 independent_review。
+    # 记账的默认防线是下面 confirmation 段里的人工确认——比机器复核更准也更便宜。
+    verification: null
+
+  # ---- agent：归类需要结合用户历史习惯，且商户名常常不规范 ----
+  - id: normalize
+    name: 商户归类
+    executor: agent
+    role: merchant_classifier
+    tool_whitelist: [lookup_merchant, query_ledger, list_categories]
+    requires: [text]
+    tier: cheap
+    max_rounds: 3
+    depends_on: [extract]
+    inputs:
+      merchant_raw: { $ref: "extract.merchant" }
+    output_schema_ref: bookkeeping.Merchant
+    timeout_ms: 8000
+    idempotent: true
+    on_failure: fail_task
+
+  # ---- tool：输入是已定字段，输出唯一，没有任何可调整的余地 ----
+  - id: dedupe
+    name: 重复检查
+    executor: tool
+    tool: dedupe_check
+    tier: null                      # 纯查表，不需要模型
+    required_capabilities: []
+    depends_on: [extract]
+    inputs:
+      fields: { $ref: "extract" }
+      lookback_days: 3
+    output_schema_ref: bookkeeping.DedupeResult
+    timeout_ms: 3000
+    optional: true
+    idempotent: true
+    on_failure: continue_with_default
+    default_output: { duplicate: false, matched_entry_id: null }
+
+  # ---- tool：写库 ----
+  - id: write
+    name: 生成待入账凭证
+    executor: tool
+    tool: build_ledger_entry
+    tier: null
+    required_capabilities: []
+    depends_on: [normalize, dedupe]
+    inputs:
+      fields: { $ref: "extract" }
+      merchant: { $ref: "normalize" }
+      duplicate_checked: { $ref: "dedupe" }
+    output_schema_ref: bookkeeping.LedgerEntry
+    timeout_ms: 5000
+    idempotent: true                # 调度层注入稳定的 idempotency_token，重试不会重复入账
+    on_failure: fail_task
+
+edges:
+  - { from: extract, to: normalize }
+  - { from: extract, to: dedupe }
+  - { from: normalize, to: write }
+  - { from: dedupe, to: write }
+
+join:
+  write: [normalize, dedupe]
+
+max_parallelism: 3
+
+# -----------------------------------------------------------------------------
+# 人工确认。这是整个模板里最要紧的一段。
+#
+# 抽取置信度不足时**停下来问**，而不是猜一个答案写进账本。猜错的代价不是"结果不够好"，
+# 而是账目被静默污染——而且用户往往几个月后才发现。
+#
+# 用户的每一次修改都会被记为 human_signal.edits，成为 04 最有价值的输入：
+# 它同时给出了错在哪（field）和对的是什么（to），是带真值的标注。
+# -----------------------------------------------------------------------------
+confirmation:
+  insert_before: write
+  on_condition: extract.confidence < routes[vision_extract_then_write].requires_confirmation_below_confidence
+  question_template: "从这张图里读到：{amount} {currency}，{merchant}，{category}。确认入账吗？"
+  options:
+    - { id: confirm, label: 确认 }
+    - { id: edit, label: 改一下 }
+    - { id: cancel, label: 不入账 }
+  blocking: true
+  # 答复后的分支：
+  #   confirm → 直接继续；
+  #   edit    → 把修改合并回 extract 的输出再继续；
+  #   cancel  → 任务以 cancelled 结束，且**不执行** write。
+  # 超时未答复按 blocking=false 处理：任务停在 awaiting_clarification，不自动入账。
+  on_timeout: stay_pending

@@ -1,0 +1,57 @@
+{
+  "profile_version": "1.0",
+  "policy_version": "pv_2026-10-01_03",
+  "task_type": "bookkeeping.capture_from_receipt",
+  "intent_summary": "用户上传一张支付截图并附文字，意图记录一笔餐饮支出。",
+  "modality": ["image", "text"],
+  "complexity": {
+    "score": 0.42,
+    "band": "medium",
+    "reasons": ["需视觉字段抽取", "需商户归类", "需与近期流水查重"]
+  },
+  "urgency": {
+    "level": "normal",
+    "reasons": []
+  },
+  "vision": {
+    "required": true,
+    "image_roles": ["source_document"],
+    "expected_extraction": ["amount", "merchant", "datetime", "payment_method"]
+  },
+  "candidate_capabilities": [
+    "bookkeeping.expense.record",
+    "bookkeeping.ledger.query"
+  ],
+  "required_capabilities": ["vision.extract", "ledger.write", "category.infer"],
+  "data_sensitivity": "financial",
+  "estimated_scale": {
+    "input_tokens_bucket": "s",
+    "output_tokens_bucket": "m",
+    "est_tool_calls": 4
+  },
+  "est_cost": {
+    "currency": "CNY",
+    "min": 0.004,
+    "max": 0.021,
+    "basis": "pricing.yaml@v3"
+  },
+  "est_latency_ms": { "min": 1400, "max": 7000 },
+  "recommended_mode": "async",
+  "needs_clarification": false,
+  "clarification": null,
+  "confidence": 0.86,
+  "degraded": false,
+  "profile_cache": {
+    "hit": false,
+    "key": null,
+    "source_task_id": null,
+    "similarity": null
+  },
+  "evaluator": {
+    "tier": "cheap",
+    "model_resolved": "<resolved-by-config>",
+    "escalated_from": null,
+    "latency_ms": 412,
+    "tokens": { "in": 1180, "out": 96 }
+  }
+}

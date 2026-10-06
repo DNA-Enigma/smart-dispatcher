@@ -1,0 +1,257 @@
+# =============================================================================
+# 04 自进化的确定性检测器
+# =============================================================================
+# 这一层完全不使用 LLM：它便宜、确定、每次都跑。LLM 只在它筛出的证据包上做
+# 归因与取舍。
+#
+# 每个检测器都必须声明 source_field —— 即该指标从 RunLog 的哪个字段算出来。
+# 契约一致性检查会验证：这里出现的每个 source_field 都真实存在于
+# schemas/run_log.json 中。反之亦然：RunLog 里不存在"采集了但从不使用"的字段。
+#
+# 阈值全部在本文件里。代码中不得出现任何字面量比较。
+# =============================================================================
+
+detectors_version: "1.0"
+
+detectors:
+  # ---- 成本 ----
+  - id: budget_pressure
+    metric: budget_exceeded_rate
+    source_field: outcome.status
+    aggregate: rate
+    predicate: status == budget_exceeded
+    threshold: 0.05
+    window: 7d
+    min_sample: 30
+    severity: medium
+    suggests: [threshold_change]
+
+  - id: budget_warn_pressure
+    metric: budget_warn_rate
+    source_field: outcome.budget_warned
+    aggregate: rate
+    predicate: budget_warned == true
+    threshold: 0.25
+    window: 7d
+    min_sample: 30
+    severity: low
+    suggests: [threshold_change]
+
+  - id: cost_estimate_bias
+    metric: est_cost_error_ratio
+    source_field: profile.est_cost_max
+    compare_with: outcome.total_cost
+    aggregate: p90_of_ratio
+    threshold: 0.40          # 估算上限高于实际值 40% 以上即为系统性高估
+    window: 30d
+    min_sample: 50
+    severity: low
+    suggests: [threshold_change]
+
+  # ---- 路由质量 ----
+  - id: guard_overrule
+    metric: guard_overrule_rate
+    source_field: decision.guard_applied
+    aggregate: rate
+    predicate: guard_applied is non-empty
+    threshold: 0.15
+    window: 7d
+    min_sample: 30
+    severity: high
+    # 守卫推翻率持续偏高，几乎总意味着 when 散文与实际流量不符。
+    suggests: [route_guidance_patch, tier_change, tool_set_change]
+
+  - id: tier_inflation
+    metric: mean_tier_index
+    source_field: decision.model_tier
+    aggregate: mean_of_ordinal      # 档位序数由 model_tiers 的定义顺序决定
+    tier_order: [cheap, standard, strong]
+    threshold: 1.80                 # 均值逼近 strong 即为通胀
+    window: 7d
+    min_sample: 30
+    severity: medium
+    suggests: [tier_change, route_guidance_patch]
+
+  - id: fallback_rate
+    metric: fallback_used_rate
+    source_field: decision.fallback_used
+    aggregate: rate
+    predicate: fallback_used == true
+    threshold: 0.02
+    window: 7d
+    min_sample: 30
+    severity: high
+    suggests: [route_guidance_patch, prompt_patch]
+
+  - id: escalation_rate
+    metric: escalation_rate
+    source_field: outcome.escalations
+    aggregate: rate
+    predicate: escalations > 0
+    threshold: 0.10
+    window: 7d
+    min_sample: 30
+    severity: medium
+    suggests: [tier_change]
+
+  - id: low_confidence
+    metric: decision_low_confidence_rate
+    source_field: decision.confidence
+    aggregate: rate
+    predicate: confidence < thresholds.escalate_below_confidence
+    threshold: 0.15
+    window: 7d
+    min_sample: 30
+    severity: medium
+    suggests: [route_guidance_patch, prompt_patch]
+
+  # ---- 画像与词表 ----
+  - id: taxonomy_miss
+    metric: taxonomy_miss_rate
+    source_field: profile.taxonomy_miss
+    aggregate: rate
+    predicate: taxonomy_miss == true
+    threshold: 0.03
+    window: 14d
+    min_sample: 50
+    severity: medium
+    suggests: [taxonomy_add]
+
+  - id: evaluator_degraded
+    metric: evaluator_degraded_rate
+    source_field: profile.degraded
+    aggregate: rate
+    predicate: degraded == true
+    threshold: 0.01
+    window: 7d
+    min_sample: 30
+    severity: high
+    suggests: [prompt_patch, threshold_change]
+
+  # ---- 拆解与执行 ----
+  - id: template_miss
+    metric: flow_template_miss_rate
+    source_field: plan.template_miss
+    aggregate: rate
+    predicate: template_miss == true
+    threshold: 0.20
+    window: 14d
+    min_sample: 30
+    severity: medium
+    # 同一个形状被反复自由拆解 → 该把它固化成具名模板。
+    suggests: [flow_template_add]
+
+  - id: replan_rate
+    metric: replan_rate
+    source_field: plan.replans
+    aggregate: rate
+    predicate: replans > 0
+    threshold: 0.05
+    window: 7d
+    min_sample: 30
+    severity: medium
+    suggests: [prompt_patch, flow_template_add]
+
+  - id: schema_validation_failure
+    metric: schema_validation_failed_rate
+    source_field: nodes[].schema_validation.ok
+    aggregate: rate
+    predicate: ok == false
+    threshold: 0.05
+    window: 7d
+    min_sample: 30
+    severity: high
+    suggests: [validator_relaxation, prompt_patch]
+
+  # ---- 质量与体验 ----
+  - id: human_edit
+    metric: human_edit_rate
+    source_field: human_signal.verdict
+    aggregate: rate
+    predicate: verdict == edited
+    threshold: 0.20
+    window: 7d
+    min_sample: 20
+    severity: high
+    # 用户改单是最有价值的信号：它同时给出了错在哪（field）和对的是什么（to）。
+    suggests: [prompt_patch, taxonomy_add, route_guidance_patch]
+
+  - id: human_reject
+    metric: human_reject_rate
+    source_field: human_signal.verdict
+    aggregate: rate
+    predicate: verdict == rejected
+    threshold: 0.08
+    window: 7d
+    min_sample: 20
+    severity: high
+    suggests: [prompt_patch, tier_change]
+
+  - id: field_edit_hotspot
+    metric: field_edit_rate
+    source_field: human_signal.edits[].field
+    aggregate: per_key_rate
+    threshold: 0.15
+    window: 14d
+    min_sample: 20
+    severity: medium
+    # 按字段细分：总改单率不高但某一字段总被改，说明该字段的抽取提示词有问题。
+    suggests: [prompt_patch]
+
+  - id: rework_rate
+    metric: rework_rate
+    source_field: parent_task_id
+    aggregate: rate
+    predicate: parent_task_id is not null
+    threshold: 0.10
+    window: 7d
+    min_sample: 30
+    severity: medium
+    suggests: [prompt_patch, route_guidance_patch]
+
+  - id: node_latency
+    metric: node_latency_p95
+    source_field: nodes[].latency_ms
+    aggregate: p95
+    group_by: nodes[].tool
+    threshold: 10000
+    window: 7d
+    min_sample: 50
+    severity: low
+    suggests: [threshold_change]
+
+  - id: queue_pressure
+    metric: node_queue_p95
+    source_field: nodes[].queue_ms
+    aggregate: p95
+    threshold: 800
+    window: 7d
+    min_sample: 50
+    severity: low
+    # 排队时间长说明并发度偏低——但并发度在 locked_paths 里，故此类建议只会
+    # 呈现给使用者，不会被自动应用，也不会指向 limits.*。
+    suggests: []
+    advisory_only: true
+
+  # ---- 自进化机制自身的健康度 ----
+  - id: suggestion_drop_rate
+    metric: suggestion_discard_rate
+    source_field: internal
+    aggregate: rate
+    threshold: 0.30
+    window: 30d
+    min_sample: 10
+    severity: medium
+    # 建议在确定性校验阶段被大量丢弃，说明分析提示词产出的东西不合规。
+    suggests: [prompt_patch]
+
+  - id: approval_reject_rate
+    metric: suggestion_reject_rate
+    source_field: internal
+    aggregate: rate
+    threshold: 0.50
+    window: 30d
+    min_sample: 5
+    severity: medium
+    # 用户频繁拒绝建议，意味着分析在提"看起来合理但没用"的东西。
+    suggests: [prompt_patch]

@@ -1,0 +1,10 @@
+{
+  "request_id": "req_bad_01",
+  "identity": {
+    "user_id": "u_123"
+  },
+  "input": {},
+  "constraints": {
+    "data_sensitivity": "financial"
+  }
+}

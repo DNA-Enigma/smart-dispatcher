@@ -1,0 +1,159 @@
+# =============================================================================
+# 记账 handler 的声明 —— 示例
+# =============================================================================
+# **这不是契约的一部分，也不是实现。** 它是 M1 用来喂给评估器与守卫的示例清单：
+# 评估器需要一份能力目录才能只从真实存在的能力里选，守卫需要工具白名单才能做子集判定。
+#
+# 真正的 bookkeeping handler 在 M4 接入，届时由它自己的声明取代这份文件。
+# 放在 examples/ 而不是 config/ 里，就是为了不让人误以为它是契约。
+#
+# 内容与 docs/07-handler-seam.md 的工具表逐行对应——那份文档是这份文件的设计依据。
+# =============================================================================
+
+handler_id: bookkeeping
+version: "0.1.0"
+
+capabilities:
+  - bookkeeping.expense.record
+  - bookkeeping.income.record
+  - bookkeeping.ledger.query
+  - bookkeeping.report.monthly
+  - bookkeeping.investment.position
+  - bookkeeping.investment.analysis
+  - bookkeeping.reconciliation
+  - bookkeeping.budget_plan
+
+flows:
+  - receipt_to_entry
+  - monthly_reconciliation
+
+required_ports: [media, llm, store]
+
+tools:
+  # ---- 视觉抽取：需要视觉能力。工具说的是"我需要看图"，不是"我要哪个模型"。 ----
+  - name: extract_receipt_fields
+    description: 从票据、支付截图、账单中抽取金额、商户、时间、支付方式等字段。
+    side_effects: none
+    requires_capabilities: [vision.extract]
+    idempotent: true
+    output_schema_ref: bookkeeping.ReceiptFields
+
+  - name: crop_and_zoom
+    description: 裁剪并放大图像的一块区域后重新识别，用于字迹模糊或字段分散的情形。
+    side_effects: none
+    requires_capabilities: [vision.extract]
+    idempotent: true
+
+  - name: read_media_region
+    description: 读取图像指定区域的文字，不改动图像。
+    side_effects: none
+    requires_capabilities: [vision.extract]
+    idempotent: true
+
+  # ---- 归类：需要判断，但不需要视觉 ----
+  - name: normalize_merchant
+    description: 把商户名规范化并归入用户自己的分类体系。
+    side_effects: read
+    requires_capabilities: [text]
+    idempotent: true
+    output_schema_ref: bookkeeping.Merchant
+
+  - name: lookup_merchant
+    description: 按名称查已知商户库，纯查表。
+    side_effects: read
+    requires_capabilities: []
+    idempotent: true
+
+  - name: list_categories
+    description: 列出该用户自定义的分类体系。
+    side_effects: read
+    requires_capabilities: []
+    idempotent: true
+
+  # ---- 读操作：纯查表，不需要模型 ----
+  - name: dedupe_check
+    description: 在最近流水中查找是否已存在同一笔往来，用于避免重复入账。
+    side_effects: read
+    requires_capabilities: []
+    idempotent: true
+    output_schema_ref: bookkeeping.DedupeResult
+
+  - name: query_ledger
+    description: 按时间范围与条件查询账目。
+    side_effects: read
+    requires_capabilities: []
+    idempotent: true
+
+  - name: compare_entries
+    description: 比对多笔记录之间的差异，用于对账。
+    side_effects: read
+    requires_capabilities: []
+    idempotent: true
+
+  # ---- 写操作：需要幂等 token，重试不会重复入账 ----
+  - name: build_ledger_entry
+    description: 写入一笔账目。
+    side_effects: write
+    requires_capabilities: []
+    idempotent: true
+    output_schema_ref: bookkeeping.LedgerEntry
+    # **必须声明。** 参数抽取环节靠它决定产出的形状；不声明的话抽取器只能猜，
+    # 而猜错的后果不是报错，是"写进去一条空记录却报成功"——真实跑出来的教训。
+    input_schema:
+      type: object
+      required: [fields]
+      properties:
+        fields:
+          type: object
+          required: [amount]
+          properties:
+            amount: { type: number, description: 金额，正数 }
+            currency: { type: string, default: CNY }
+            merchant: { type: string }
+            datetime: { type: string }
+            direction: { type: string, enum: [expense, income] }
+            category: { type: string }
+        merchant: { type: object, description: 归类结果，可选 }
+        duplicate_checked: { type: object, description: 查重结果，可选 }
+
+  # ---- 纯算术：能力需求显式为空 ----
+  # 这条声明是有约束力的：调度层不会给它配模型。portfolio 的净值、收益率、
+  # 与基准的对比都是确定的算术，让模型来算只会引入不必要的误差与不确定性。
+  - name: compute_portfolio
+    description: 计算持仓市值、成本、收益率与基准对比。纯算术，无模型。
+    side_effects: none
+    requires_capabilities: []
+    idempotent: true
+
+  # ---- 需要强推理：用能力名表达强度，不写档位名 ----
+  - name: generate_financial_plan
+    description: 结合收支结构与持仓给出财务规划建议，需要较强的推理能力。
+    side_effects: read
+    requires_capabilities: [text, reasoning.strong]
+    idempotent: false
+
+config_schema:
+  type: object
+  properties:
+    default_currency: { type: string, default: "CNY" }
+    categories:
+      type: array
+      items: { type: string }
+      description: 用户自定义的分类体系。归类只能落在这个集合里。
+    confirmation:
+      type: object
+      properties:
+        auto_confirm_above_confidence: { type: number, minimum: 0, maximum: 1 }
+        require_confirm_on_amount_above: { type: number }
+    privacy:
+      type: object
+      properties:
+        retain_receipt_images_days:
+          type: integer
+          minimum: 0
+          description: 0 表示任务结束即删除原始截图。
+    investment:
+      type: object
+      properties:
+        tracking_enabled: { type: boolean }
+        benchmark: { type: string }

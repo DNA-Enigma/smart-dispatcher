@@ -1,0 +1,42 @@
+{
+  "suggestion_id": "sg_01J8ZR9B2X",
+  "created_at": "2026-10-06T03:00:00Z",
+  "analysis_window": {
+    "from": "2026-09-29T00:00:00+08:00",
+    "to": "2026-10-06T00:00:00+08:00"
+  },
+  "sample_size": 412,
+  "kind": "code_refactor",
+  "target": {
+    "artifact": "dispatcher/core/stages/dag_runner.py",
+    "path": "DagRunner._run_wave",
+    "current": "Semaphore(plan.max_parallelism)",
+    "proposed": "asyncio.Semaphore(16)  # 提高并发以降低延迟"
+  },
+  "evidence": {
+    "metric": "node_latency_p95",
+    "before": 3100,
+    "after_estimate": 1900,
+    "affected_run_ids": ["run_01J8ZP11"],
+    "distinct_users_affected": 1,
+    "counterfactual": "并发度从 3 提到 16 可缩短整体墙钟时间。"
+  },
+  "rationale": "整体延迟偏高，建议直接改执行器的并发常量。",
+  "confidence": 0.9,
+  "risk": "high",
+  "blast_radius": ["dispatcher/core/stages/dag_runner.py"],
+  "guards": {
+    "locked_path": false,
+    "delta_within_limit": true,
+    "sample_ok": true
+  },
+  "rollback": {
+    "method": "file_revert",
+    "to_version": null
+  },
+  "status": "proposed",
+  "decided_by": null,
+  "decided_at": null,
+  "decision_note": null,
+  "resulting_policy_version": null
+}

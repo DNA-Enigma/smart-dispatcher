@@ -1,0 +1,22 @@
+{
+  "decision_version": "1.0",
+  "policy_version": "pv_2026-10-01_03",
+  "route_id": "direct_answer",
+  "path": "direct_llm",
+  "model_tier": "cheap",
+  "handler": "bookkeeping",
+  "tool_set": ["build_ledger_entry"],
+  "execution_mode": "sync",
+  "decompose": false,
+  "budget": {
+    "max_cost": 0.003,
+    "max_wall_ms": 8000,
+    "max_llm_calls": 1
+  },
+  "rationale": "看起来是一句普通的话，直接回答即可。",
+  "confidence": 0.9,
+  "guard": {
+    "applied": [],
+    "fallback_used": false
+  }
+}

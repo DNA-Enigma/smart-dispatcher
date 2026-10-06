@@ -1,0 +1,869 @@
+openapi: 3.1.0
+
+info:
+  title: Smart 调度层
+  version: "1.0.0"
+  summary: 语言无关的任务调度契约：评估 → 路由 → 拆解并行执行 → 自进化
+  description: |
+    这套契约是通用的、与实现语言无关的。任何语言、任何端的实现都应以它为准，
+    并以 `docs/10-conformance-checklist.md` 作为验收清单。
+
+    **核心约定**
+
+    - 调度层只理解请求的结构，不理解任何领域语义。领域逻辑由「能力 handler」以插件
+      形式接入，接入新领域不需要修改调度层（见 `docs/07-handler-seam.md`）。
+    - 契约中**永不出现具体模型标识**，只出现「档位」（cheap / standard / strong）。
+      档位到模型的映射在服务端配置里。
+    - 错误一律是结构化的 `Problem`，**不得**把上游异常吞成字符串再拼进正文。
+    - 任务状态与进度字段刻意对齐 `ai-workmate` 的 Flutter 客户端词汇，
+      使移动端任务看板可 1:1 映射。
+  license:
+    name: UNLICENSED
+
+servers:
+  - url: https://dispatcher.local/v1
+    description: 本地参考实现
+  - url: http://localhost:8080/v1
+    description: 开发
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: tasks
+    description: 任务提交、查询、事件流、澄清、反馈
+  - name: media
+    description: 图像/音频/文档的上传与取用
+  - name: capabilities
+    description: 已注册 handler 与其工具的自省
+  - name: policy
+    description: 策略版本读取与回滚
+  - name: evolution
+    description: 自进化建议的列出、审批、拒绝与手动触发分析
+  - name: usage
+    description: 成本与用量记账
+  - name: health
+    description: 健康与依赖状态
+
+paths:
+  # ===========================================================================
+  # 任务
+  # ===========================================================================
+  /tasks:
+    post:
+      tags: [tasks]
+      operationId: createTask
+      summary: 提交任务
+      description: |
+        提交一个任务。响应模式取决于 `constraints.mode_preference` 与路由仲裁结果：
+
+        - `async`：立即返回 `202` + `task_id`，之后通过 `GET /tasks/{id}` 或事件流跟踪。
+        - `sync`：内联执行完返回 `200`，并**同时**内联 `profile` / `decision` / `result`，
+          使同步调用方一次往返拿全，不必再查三次。
+
+        同步是优化、异步是基底：同一个流水线只实现一次。若路由仲裁发现投影耗时超过
+        `limits.sync_timeout_ms`，任务会被**提升为异步**，返回 `202` 并带
+        `mode_changed: true` 与原因。
+
+        凡可能命中含 `write` 副作用工具的任务，`idempotency_key` 必填。同一 key
+        加同一请求体哈希视为重放，返回既有任务而非重跑；key 相同而体不同返回 `409`。
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "./schemas/task_envelope.json"
+            examples:
+              receipt:
+                summary: 上传餐饮支付截图并附文字
+                value:
+                  $ref: "./fixtures/task_envelope.example.json"
+      responses:
+        "200":
+          description: 同步执行完成
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/TaskAccepted"
+                  - type: object
+                    properties:
+                      status:
+                        type: string
+                        enum: [succeeded, failed, awaiting_clarification, rejected]
+                      profile: { $ref: "./schemas/task_profile.json" }
+                      decision: { $ref: "./schemas/route_decision.json" }
+                      result:
+                        type: [object, "null"]
+                        additionalProperties: true
+        "202":
+          description: 已受理，异步执行中
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TaskAccepted"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "402": { $ref: "#/components/responses/BudgetExceeded" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "415": { $ref: "#/components/responses/UnsupportedMedia" }
+        "422": { $ref: "#/components/responses/Unprocessable" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "502": { $ref: "#/components/responses/UpstreamError" }
+
+    get:
+      tags: [tasks]
+      operationId: listTasks
+      summary: 列出任务
+      parameters:
+        - name: user_id
+          in: query
+          schema: { type: string }
+        - name: status
+          in: query
+          schema:
+            type: array
+            items:
+              type: string
+              enum: [received, evaluating, routing, planning, running, awaiting_clarification, escalated, succeeded, failed, cancelled, budget_exceeded, rejected]
+        - name: cursor
+          in: query
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+      responses:
+        "200":
+          description: 任务列表（游标分页）
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "./schemas/task_snapshot.json" }
+                  next_cursor: { type: [string, "null"] }
+
+  /tasks/{task_id}:
+    get:
+      tags: [tasks]
+      operationId: getTask
+      summary: 获取任务快照
+      description: |
+        移动端任务看板直接渲染本响应：`status`、`progress`、`plan.nodes[].status`
+        与 Flutter 侧 `TaskStatus` / `progress` / `TaskStep` 一一对应。
+      parameters:
+        - $ref: "#/components/parameters/TaskId"
+      responses:
+        "200":
+          description: 任务快照
+          content:
+            application/json:
+              schema: { $ref: "./schemas/task_snapshot.json" }
+              examples:
+                running:
+                  value: { $ref: "./fixtures/task_snapshot.example.json" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /tasks/{task_id}/events:
+    get:
+      tags: [tasks]
+      operationId: streamTaskEvents
+      summary: 订阅任务事件流（SSE）
+      description: |
+        `text/event-stream`。每个事件的 `id:` 字段即事件日志的单调 `seq`。
+
+        **断线重放**：客户端重连时带上 `Last-Event-ID: <seq>`（或 `?since=<seq>`），
+        服务端先重放 `seq+1` 起的全部事件，再切换到实时推送。这是移动端必须的能力——
+        应用退到后台、网络切换、锁屏都会断连，而任务仍在服务端继续执行。
+
+        因此事件日志必须是**持久**的，不能只喂活连接。事件类型与载荷见
+        `schemas/event.json`；`heartbeat` 按 `limits.sse_heartbeat_ms` 发送，
+        用于穿透 NAT 保持连接。
+      parameters:
+        - $ref: "#/components/parameters/TaskId"
+        - name: since
+          in: query
+          description: 从该 seq 之后开始重放。与 Last-Event-ID 同时提供时以 Last-Event-ID 为准。
+          schema: { type: integer, minimum: 0 }
+        - name: Last-Event-ID
+          in: header
+          schema: { type: integer, minimum: 0 }
+      responses:
+        "200":
+          description: 事件流
+          headers:
+            Cache-Control:
+              schema: { type: string, const: no-cache }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /tasks/{task_id}/result:
+    get:
+      tags: [tasks]
+      operationId: getTaskResult
+      summary: 获取任务产物
+      parameters:
+        - $ref: "#/components/parameters/TaskId"
+      responses:
+        "200":
+          description: 终态产物
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [task_id, status]
+                additionalProperties: true
+                properties:
+                  task_id: { type: string }
+                  status: { type: string }
+                  artifacts: { type: [object, "null"], additionalProperties: true }
+        "409":
+          description: 任务尚未到达终态。失败或取消的任务保留部分产物并在此返回。
+          content:
+            application/json:
+              schema: { $ref: "./schemas/problem.json" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /tasks/{task_id}/clarify:
+    post:
+      tags: [tasks]
+      operationId: clarify
+      summary: 回答澄清问题
+      description: |
+        `awaiting_clarification` 是**正常状态**而非异常。记账场景中「这是支出还是收入」
+        必须问清楚：猜错的代价不是结果不够好，而是账目被静默污染。
+
+        答复后任务从 `awaiting_clarification` 回到 `running` 继续执行。
+        `partial_profile` 与答复合并，评估器不会从头重问。
+      parameters:
+        - $ref: "#/components/parameters/TaskId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [question_id]
+              additionalProperties: false
+              properties:
+                question_id: { type: string }
+                answer_id: { type: [string, "null"], description: 选项 id。自由文本回答时可为空。 }
+                free_text: { type: [string, "null"] }
+                edits:
+                  type: [object, "null"]
+                  additionalProperties: true
+                  description: 用户对已抽取字段的修改。会记录为 human_signal.edits，是 04 最有价值的信号。
+      responses:
+        "200":
+          description: 已受理，任务恢复执行
+          content:
+            application/json:
+              schema: { $ref: "./schemas/task_snapshot.json" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/Unprocessable" }
+
+  /tasks/{task_id}/cancel:
+    post:
+      tags: [tasks]
+      operationId: cancelTask
+      summary: 取消任务
+      description: |
+        幂等：任务已处于终态时仍返回 `204`。取消会传播到执行中的节点，
+        已完成节点的产物保留并如实上报——已抽取出的票据字段即使未能入账也有价值。
+      parameters:
+        - $ref: "#/components/parameters/TaskId"
+      responses:
+        "204": { description: 已取消或已处于终态 }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /tasks/{task_id}/feedback:
+    post:
+      tags: [tasks]
+      operationId: submitFeedback
+      summary: 提交人工质量信号
+      description: |
+        这是 04 自进化的主要输入，也是最难自动化获取的一类数据。记账场景的自然采集点
+        就是确认/修改页：用户把分类从「其他」改成「餐饮」，就等于给出了一条带真值的标注。
+
+        没有这个端点，04 只能靠延迟与成本反推质量，效果差一个量级。
+      parameters:
+        - $ref: "#/components/parameters/TaskId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [verdict]
+              additionalProperties: false
+              properties:
+                verdict: { type: string, enum: [accepted, edited, rejected, ignored] }
+                edits:
+                  type: array
+                  items:
+                    type: object
+                    required: [field, from, to]
+                    additionalProperties: false
+                    properties:
+                      field: { type: string }
+                      from: {}
+                      to: {}
+                reason: { type: [string, "null"] }
+      responses:
+        "204": { description: 已记录 }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  # ===========================================================================
+  # 媒体
+  # ===========================================================================
+  /media:
+    post:
+      tags: [media]
+      operationId: uploadMedia
+      summary: 上传媒体
+      description: |
+        调度层自带本端点。调用方不必自行实现上传、签名、保留期与清理。
+
+        **允许的 MIME 由策略的 `limits.media.allowed_mime` 决定，本文件不重复列举**——
+        这里之前列过 `image/heic`，而策略与 `docs/05-media.md` 都已因供应商读不了 HEIC
+        把它移除，只有本文件没同步。契约与配置各写一份允许列表，就一定会分叉：
+        以策略为准，这里只说明"由策略决定"。
+
+        上传后得到一个 `media_id`，在 `POST /tasks` 里以引用形式使用。
+        请求体是原始字节（`Content-Type` 必须为允许的 MIME），或 `multipart/form-data`。
+
+        媒体在任务范围内有效；任务结束后按该用户的
+        `privacy.retain_receipt_images_days` 决定保留时长，
+        默认 0 表示不保留原图。04 的分析只在结构化字段与哈希摘要上进行。
+      requestBody:
+        required: true
+        content:
+          # 这里只列常见的几种作为示意；**真正的白名单在策略里**，服务端按它校验。
+          image/png:
+            schema: { type: string, format: binary }
+          image/jpeg:
+            schema: { type: string, format: binary }
+          image/webp:
+            schema: { type: string, format: binary }
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, format: binary }
+                retain_days:
+                  type: integer
+                  minimum: 0
+                  description: 覆盖该用户配置的保留天数。0 表示任务结束即删除。
+      responses:
+        "201":
+          description: 已上传
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [media_id, kind, mime, bytes, sha256]
+                additionalProperties: false
+                properties:
+                  media_id: { type: string }
+                  kind: { type: string, enum: [image, audio, pdf, document] }
+                  mime: { type: string }
+                  bytes: { type: integer, minimum: 1 }
+                  sha256: { type: string, pattern: "^[a-f0-9]{64}$" }
+                  expires_at: { type: [string, "null"], format: date-time }
+                  url:
+                    type: [string, "null"]
+                    format: uri
+                    description: 短期签名 URL。手机端预览用，不要持久化。
+        "413": { $ref: "#/components/responses/MediaTooLarge" }
+        "415": { $ref: "#/components/responses/UnsupportedMedia" }
+
+  /media/{media_id}:
+    get:
+      tags: [media]
+      operationId: getMedia
+      summary: 取回媒体
+      description: 短期签名 URL 的备用通道。已过保留期的媒体返回 `404`。
+      parameters:
+        - name: media_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: 媒体字节
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  # ===========================================================================
+  # 能力自省
+  # ===========================================================================
+  /capabilities:
+    get:
+      tags: [capabilities]
+      operationId: listCapabilities
+      summary: 列出已注册的 handler 与工具
+      description: |
+        接入方用它发现可用能力；同时也是 01 评估器的输入之一——评估器只能从
+        `candidate_capabilities` 里挑 handler 真正声明过的能力，这就是插件接缝。
+      responses:
+        "200":
+          description: 能力目录
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [handlers]
+                properties:
+                  handlers:
+                    type: array
+                    items:
+                      type: object
+                      required: [handler_id, version, capabilities, tools]
+                      additionalProperties: false
+                      properties:
+                        handler_id: { type: string }
+                        version: { type: string }
+                        capabilities: { type: array, items: { type: string } }
+                        flows: { type: array, items: { type: string } }
+                        tools:
+                          type: array
+                          items:
+                            type: object
+                            required: [name, side_effects, requires_capabilities, idempotent]
+                            additionalProperties: false
+                            properties:
+                              name: { type: string }
+                              description: { type: [string, "null"] }
+                              side_effects: { type: string, enum: [none, read, write] }
+                              requires_capabilities: { type: array, items: { type: string } }
+                              idempotent: { type: boolean }
+                              input_schema: { type: [object, "null"], additionalProperties: true }
+                              output_schema_ref: { type: [string, "null"] }
+                        config_schema: { type: [object, "null"], additionalProperties: true }
+
+  # ===========================================================================
+  # 策略
+  # ===========================================================================
+  /policy:
+    get:
+      tags: [policy]
+      operationId: getPolicy
+      summary: 读取当前生效策略
+      description: 密钥引用（`secret://...`）会被脱敏，只保留前缀。
+      responses:
+        "200":
+          description: 当前策略与其版本
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [policy_version]
+                additionalProperties: true
+                properties:
+                  policy_version: { type: string }
+
+  /policy/versions:
+    get:
+      tags: [policy]
+      operationId: listPolicyVersions
+      summary: 策略版本历史
+      responses:
+        "200":
+          description: 版本列表，最新在前
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      required: [policy_version, created_at, status]
+                      additionalProperties: false
+                      properties:
+                        policy_version: { type: string }
+                        parent_version: { type: [string, "null"] }
+                        created_at: { type: string, format: date-time }
+                        approved_by: { type: [string, "null"] }
+                        suggestion_id: { type: [string, "null"] }
+                        status: { type: string, enum: [canary, active, superseded, rolled_back] }
+
+  /policy/rollback:
+    post:
+      tags: [policy]
+      operationId: rollbackPolicy
+      summary: 回滚到指定策略版本
+      description: |
+        配置改动一律通过版本回滚，不需要反向补丁。回滚即时、彻底、无副作用——
+        这正是「进化只动配置、不动代码」的收益之一。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [to_version]
+              additionalProperties: false
+              properties:
+                to_version: { type: string }
+                scope:
+                  type: object
+                  additionalProperties: false
+                  properties:
+                    level: { type: string, enum: [user, tenant, app] }
+                    user_id: { type: [string, "null"] }
+                    tenant_id: { type: [string, "null"] }
+                note: { type: [string, "null"] }
+      responses:
+        "200":
+          description: 已回滚
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [policy_version]
+                properties:
+                  policy_version: { type: string }
+                  rolled_back_from: { type: string }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  # ===========================================================================
+  # 自进化
+  # ===========================================================================
+  /evolution/suggestions:
+    get:
+      tags: [evolution]
+      operationId: listSuggestions
+      summary: 列出改进建议
+      description: |
+        建议只在这里被读取与审批。契约**不建模 admin 角色**：审批人是策略范围的
+        所有者——单用户场景即使用者本人，多人场景为租户所有者。
+
+        使用者界面如何呈现由消费方决定（应用内「改进建议」页、通知、或仅 API）。
+        调度层只提供端点。
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [proposed, approved, rejected, applied, canarying, active, rolled_back, expired, discarded]
+        - name: scope_level
+          in: query
+          schema: { type: string, enum: [user, tenant, app] }
+      responses:
+        "200":
+          description: 建议列表
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "./schemas/suggestion.json" }
+                  last_analysis_at: { type: [string, "null"], format: date-time }
+
+  /evolution/suggestions/{suggestion_id}/approve:
+    post:
+      tags: [evolution]
+      operationId: approveSuggestion
+      summary: 批准建议（使用者本人）
+      description: |
+        批准后生成 `PolicyPatch` → 新的 `PolicyVersion` → 进入金丝雀。金丝雀期内
+        护栏指标（失败率、守卫推翻率、人工改单率、预算告警率）若相对基线劣化超过
+        `evolution.canary.rollback_margin`，自动回滚到父版本并产生一条回滚记录。
+      parameters:
+        - name: suggestion_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                scope:
+                  type: object
+                  additionalProperties: false
+                  properties:
+                    level: { type: string, enum: [user, tenant, app] }
+                    user_id: { type: [string, "null"] }
+                    tenant_id: { type: [string, "null"] }
+                    canary:
+                      type: [object, "null"]
+                      additionalProperties: false
+                      properties:
+                        mode: { type: string, enum: [traffic_ratio, route_subset, time_window] }
+                        ratio: { type: [number, "null"], minimum: 0, maximum: 1 }
+                        duration_ms: { type: [integer, "null"], minimum: 1 }
+                note: { type: [string, "null"] }
+      responses:
+        "200":
+          description: 已批准并应用
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [suggestion_id, status, policy_version]
+                properties:
+                  suggestion_id: { type: string }
+                  status: { type: string, enum: [applied, canarying] }
+                  policy_version: { type: string }
+                  patch: { $ref: "./schemas/policy_patch.json" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422":
+          description: |
+            建议不可应用。典型原因：目标路径命中 locked_paths、类型不匹配、
+            幅度超限、或 base_version 已不是当前生效版本（需重新分析）。
+          content:
+            application/json:
+              schema: { $ref: "./schemas/problem.json" }
+
+  /evolution/suggestions/{suggestion_id}/reject:
+    post:
+      tags: [evolution]
+      operationId: rejectSuggestion
+      summary: 拒绝建议
+      description: 拒绝理由本身是信号——频繁被拒说明分析在提「看起来合理但没用」的东西。
+      parameters:
+        - name: suggestion_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              additionalProperties: false
+              properties:
+                reason: { type: string }
+      responses:
+        "204": { description: 已拒绝 }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /evolution/analyze:
+    post:
+      tags: [evolution]
+      operationId: triggerAnalysis
+      summary: 手动触发一次分析
+      description: |
+        正常由定时任务按 `evolution.analysis_interval` 触发，并按用户时区窗口取数；
+        本端点用于手动补跑。同一窗口内只允许一次分析，多实例部署时用咨询锁保证——
+        这是 `ai-workmate` 的 `scheduler_lock` 模式的复用点。
+      responses:
+        "202":
+          description: 已触发
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [run_id, window]
+                properties:
+                  run_id: { type: string }
+                  window:
+                    type: object
+                    required: [from, to]
+                    properties:
+                      from: { type: string, format: date-time }
+                      to: { type: string, format: date-time }
+        "409":
+          description: 已有分析在进行中
+          content:
+            application/json:
+              schema: { $ref: "./schemas/problem.json" }
+
+  # ===========================================================================
+  # 用量
+  # ===========================================================================
+  /usage:
+    get:
+      tags: [usage]
+      operationId: getUsage
+      summary: 成本与用量
+      description: |
+        成本按 `(tenant, user, task, subtask)` 归属。注意当前的预算模式是
+        `advisory`：完整记账与告警，但**不中断执行**。硬中断是配置里可开启的模式。
+      parameters:
+        - name: user_id
+          in: query
+          schema: { type: string }
+        - name: period
+          in: query
+          schema: { type: string, enum: [today, 7d, 30d, month] }
+        - name: group_by
+          in: query
+          schema: { type: string, enum: [day, route, handler, model_tier, tool] }
+      responses:
+        "200":
+          description: 用量
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [currency, totals]
+                additionalProperties: true
+                properties:
+                  currency: { type: string }
+                  totals:
+                    type: object
+                    required: [cost, tasks, llm_calls]
+                    properties:
+                      cost: { type: number, minimum: 0 }
+                      tasks: { type: integer, minimum: 0 }
+                      llm_calls: { type: integer, minimum: 0 }
+                  buckets:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: true
+
+  # ===========================================================================
+  # 健康
+  # ===========================================================================
+  /health:
+    get:
+      tags: [health]
+      operationId: getHealth
+      summary: 健康与依赖状态
+      description: 各档位供应商的健康状况会影响路由：某档位的供应商熔断打开时，守卫会确定性地降到最近的健康档位。
+      security: []
+      responses:
+        "200":
+          description: 健康
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, tiers]
+                properties:
+                  status: { type: string, enum: [ok, degraded, down] }
+                  tiers:
+                    type: array
+                    items:
+                      type: object
+                      required: [tier, state]
+                      additionalProperties: false
+                      properties:
+                        tier: { type: string }
+                        state: { type: string, enum: [closed, half_open, open] }
+                        latency_ms: { type: [integer, "null"] }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        **令牌由消费端自己的认证体系签发，本契约不提供发放或续期的端点。**
+
+        调度层只做一件事：收到 `Authorization: Bearer <token>` 后信任它、
+        取出其中的 `user_id` 与 `tenant_id`。它不建用户、不发令牌、不管刷新——
+        那些属于产品，而一个通用调度层不该替产品决定用户体系长什么样。
+
+        如果你的部署确实需要在这里签发，那是另一件事（要引入用户表、密码/验证码流程、
+        刷新策略），应当作为独立的认证服务存在，而不是塞进调度层。
+
+  parameters:
+    TaskId:
+      name: task_id
+      in: path
+      required: true
+      schema: { type: string }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: |
+        幂等键。凡可能命中含 write 副作用工具的任务必填。
+        同 key + 同请求体哈希 → 返回既有任务（重放，不重跑）。
+        同 key + 不同请求体 → `409 idempotency_conflict`。
+      schema: { type: string, maxLength: 200 }
+
+  schemas:
+    TaskAccepted:
+      type: object
+      required: [task_id, status, mode, created_at]
+      additionalProperties: true
+      properties:
+        task_id: { type: string }
+        status: { type: string }
+        mode: { type: string, enum: [sync, async] }
+        mode_changed:
+          type: boolean
+          description: true 表示请求的同步模式被提升为异步。
+        mode_change_reason: { type: [string, "null"] }
+        projected_wall_ms: { type: [integer, "null"] }
+        sync_budget_ms: { type: [integer, "null"] }
+        created_at: { type: string, format: date-time }
+        policy_version: { type: [string, "null"] }
+        events_url: { type: [string, "null"] }
+        result_url: { type: [string, "null"] }
+        estimated: { type: [object, "null"], additionalProperties: true }
+
+  responses:
+    BadRequest:
+      description: 请求不符合 schema
+      content:
+        application/json:
+          schema: { $ref: "./schemas/problem.json" }
+    UnsupportedMedia:
+      description: MIME 或大小不被接受（在任何模型开销之前被拒）
+      content:
+        application/json:
+          schema: { $ref: "./schemas/problem.json" }
+    MediaTooLarge:
+      description: 媒体超出大小上限
+      content:
+        application/json:
+          schema: { $ref: "./schemas/problem.json" }
+    BudgetExceeded:
+      description: |
+        超出成本上限。注意：当前默认的 advisory 模式下不会返回本错误——
+        只记账与告警。仅当策略把 `budget.enforcement.mode` 设为 `hard` 时才可能出现。
+      content:
+        application/json:
+          schema: { $ref: "./schemas/problem.json" }
+    Conflict:
+      description: 状态冲突（幂等键冲突、任务已终态、结果未就绪等）
+      content:
+        application/json:
+          schema: { $ref: "./schemas/problem.json" }
+    Unprocessable:
+      description: 无法产出合法决策（无匹配能力、策略违规）
+      content:
+        application/json:
+          schema: { $ref: "./schemas/problem.json" }
+    RateLimited:
+      description: 触发限流
+      headers:
+        Retry-After:
+          schema: { type: integer }
+      content:
+        application/json:
+          schema: { $ref: "./schemas/problem.json" }
+    UpstreamError:
+      description: 上游模型供应商失败（会反馈给熔断器）
+      content:
+        application/json:
+          schema: { $ref: "./schemas/problem.json" }
+    NotFound:
+      description: 资源不存在
+      content:
+        application/json:
+          schema: { $ref: "./schemas/problem.json" }

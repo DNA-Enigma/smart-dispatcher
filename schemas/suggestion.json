@@ -1,0 +1,135 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://smart-dispatcher.dev/schemas/suggestion.json",
+  "title": "Suggestion",
+  "description": "阶段 04 Self-Evolve 的产出：一条待使用者审批的配置改进建议。由 LLM 在确定性指标之上起草，再由确定性代码校验（目标路径存在、不在 locked_paths、类型一致、变化幅度受限、样本量达标、影响面可解析）。建议永不自动生效。",
+  "type": "object",
+  "required": ["suggestion_id", "created_at", "analysis_window", "sample_size", "kind", "target", "evidence", "rationale", "confidence", "risk", "guards", "rollback", "status"],
+  "additionalProperties": false,
+  "properties": {
+    "suggestion_id": { "type": "string" },
+    "created_at": { "type": "string", "format": "date-time" },
+
+    "scope": {
+      "type": "object",
+      "description": "本建议作用的范围。配置与进化按 user_id 隔离；跨用户共性的建议才能提出到 tenant 或 app 层。",
+      "additionalProperties": false,
+      "properties": {
+        "level": { "type": "string", "enum": ["user", "tenant", "app"] },
+        "tenant_id": { "type": ["string", "null"] },
+        "user_id": { "type": ["string", "null"] }
+      }
+    },
+
+    "analysis_window": {
+      "type": "object",
+      "required": ["from", "to"],
+      "additionalProperties": false,
+      "properties": {
+        "from": { "type": "string", "format": "date-time" },
+        "to": { "type": "string", "format": "date-time" }
+      }
+    },
+    "sample_size": { "type": "integer", "minimum": 1, "description": "支撑本建议的 run 数量。必须达到 evolution.min_sample_size，否则建议在校验阶段被丢弃。" },
+    "basis_policy_version": { "type": ["string", "null"], "description": "分析所依据的策略版本。" },
+
+    "kind": {
+      "type": "string",
+      "description": "建议类型。这是封闭词表，来自 config/evolution/suggestion_kinds.yaml——系统能提出的东西是有限的，这是『代码不可改』的落地方式。",
+      "enum": [
+        "threshold_change",
+        "route_guidance_patch",
+        "tier_change",
+        "tool_set_change",
+        "flow_template_add",
+        "prompt_patch",
+        "taxonomy_add",
+        "validator_relaxation"
+      ]
+    },
+
+    "target": {
+      "type": "object",
+      "required": ["artifact", "path"],
+      "additionalProperties": false,
+      "properties": {
+        "artifact": {
+          "type": "string",
+          "description": "被改的产物文件。只能是配置或提示词，永远不包含代码。",
+          "enum": [
+            "routing.policy.yaml",
+            "taxonomy.yaml",
+            "flow_templates",
+            "prompts/evaluator.md",
+            "prompts/router.md",
+            "prompts/decomposer.md",
+            "handler.schema"
+          ]
+        },
+        "path": { "type": "string", "description": "产物内的定位路径，如 routes[vision_extract_then_write].max_cost。" },
+        "current": { "description": "当前值。快照存档即可，读取方以文件为准。" },
+        "proposed": { "description": "建议值。类型必须与当前值一致。" }
+      }
+    },
+
+    "evidence": {
+      "type": "object",
+      "description": "证据包。LLM 的作用是在这些确定性指标之上做归因与取舍，而不是自己算指标。",
+      "required": ["metric"],
+      "additionalProperties": false,
+      "properties": {
+        "metric": { "type": "string", "description": "触发本建议的检测器指标名，须来自 config/evolution/detectors.yaml。" },
+        "before": { "type": ["number", "null"] },
+        "after_estimate": { "type": ["number", "null"] },
+        "affected_run_ids": { "type": "array", "items": { "type": "string" }, "description": "抽样举证，数量有上限。" },
+        "distinct_users_affected": { "type": ["integer", "null"], "minimum": 0 },
+        "counterfactual": { "type": ["string", "null"], "description": "如『近 7 天 46 次超预算中 41 次实际成本 ≤ 0.05』——用事实说明改动为何有益。" }
+      }
+    },
+
+    "rationale": { "type": "string", "description": "面向使用者的说明。使用者要能据此独立判断，因此禁止只给结论不给依据。" },
+    "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+    "risk": { "type": "string", "enum": ["low", "medium", "high"] },
+    "blast_radius": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "受影响的路由/工具 id 列表。必须能解析到真实存在的对象。"
+    },
+
+    "guards": {
+      "type": "object",
+      "description": "确定性校验结果。任一项不通过则在入库前丢弃并计数（丢弃率升高本身也是一个信号）。",
+      "required": ["locked_path", "delta_within_limit", "sample_ok"],
+      "additionalProperties": false,
+      "properties": {
+        "locked_path": { "type": "boolean", "description": "目标路径是否落在 policy.locked_paths 内。true 表示非法，该建议必须被丢弃。" },
+        "delta_within_limit": { "type": "boolean" },
+        "sample_ok": { "type": "boolean" },
+        "type_match": { "type": ["boolean", "null"] },
+        "path_exists": { "type": ["boolean", "null"] },
+        "notes": { "type": ["array", "null"], "items": { "type": "string" } }
+      }
+    },
+
+    "rollback": {
+      "type": "object",
+      "description": "回滚方式。配置类改动一律通过版本回滚，不需要反向补丁。",
+      "required": ["method"],
+      "additionalProperties": false,
+      "properties": {
+        "method": { "type": "string", "enum": ["policy_version_rollback", "file_revert"] },
+        "to_version": { "type": ["string", "null"] }
+      }
+    },
+
+    "status": {
+      "type": "string",
+      "enum": ["proposed", "approved", "rejected", "applied", "canarying", "active", "rolled_back", "expired", "discarded"],
+      "description": "discarded 表示未通过确定性校验，从未呈现给使用者。"
+    },
+    "decided_by": { "type": ["string", "null"], "description": "审批人 = 策略范围的所有者，即使用者本人。契约不建模 admin 角色。" },
+    "decided_at": { "type": ["string", "null"], "format": "date-time" },
+    "decision_note": { "type": ["string", "null"], "description": "批准时的备注；拒绝时的理由。拒绝理由本身是后续分析的信号。" },
+    "resulting_policy_version": { "type": ["string", "null"], "description": "批准并应用后产生的新策略版本 id。" }
+  }
+}

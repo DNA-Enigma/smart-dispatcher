@@ -1,0 +1,33 @@
+{
+  "plan_version": "1.1",
+  "task_id": "task_bad_plan",
+  "strategy": "dag",
+  "source": "llm_decomposition",
+  "max_parallelism": 3,
+  "revision": 1,
+  "nodes": [
+    {
+      "subtask_id": "extract",
+      "handler": "bookkeeping",
+      "executor": "tool",
+      "tool": "extract_receipt_fields",
+      "depends_on": []
+    },
+    {
+      "subtask_id": "post_to_ledger_and_notify_accountant",
+      "handler": "bookkeeping",
+      "executor": "tool",
+      "tool": "post_ledger_and_email_accountant",
+      "depends_on": ["extract"],
+      "on_failure": "retry_forever"
+    }
+  ],
+  "edges": [
+    { "from": "extract", "to": "post_to_ledger_and_notify_accountant" }
+  ],
+  "plan_budget": {
+    "max_cost": 0.05,
+    "max_wall_ms": 30000,
+    "max_llm_calls": 8
+  }
+}

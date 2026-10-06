@@ -1,0 +1,151 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://smart-dispatcher.dev/schemas/task_envelope.json",
+  "title": "TaskEnvelope",
+  "description": "POST /v1/tasks 的请求体。调用方提交的原始请求，尚未经 01 评估。调度层只理解这里的结构，不理解任何领域语义。",
+  "type": "object",
+  "required": ["identity", "input"],
+  "additionalProperties": false,
+  "properties": {
+    "request_id": {
+      "type": "string",
+      "description": "调用方生成，用于端到端追踪。缺省时调度层生成并在响应中回传。"
+    },
+    "idempotency_key": {
+      "type": "string",
+      "description": "幂等键。凡路由可能命中含 write 副作用工具的任务，此字段必填；未提供时若评估结果指向写操作，任务以 invalid_request 拒绝。",
+      "maxLength": 200
+    },
+    "parent_task_id": {
+      "type": ["string", "null"],
+      "description": "重跑时指向原任务。重跑一律产生新任务而非改写终态任务。"
+    },
+    "identity": {
+      "type": "object",
+      "description": "身份与本地化。配置与进化按 user_id 隔离；tenant_id 为将来组织形态保留。",
+      "required": ["user_id"],
+      "additionalProperties": false,
+      "properties": {
+        "tenant_id": { "type": "string", "default": "default" },
+        "user_id": { "type": "string" },
+        "locale": { "type": "string", "description": "BCP 47，如 zh-CN。" },
+        "timezone": { "type": "string", "description": "IANA 时区，如 Asia/Shanghai。影响日报/对账等时间窗口语义。" }
+      }
+    },
+    "input": {
+      "type": "object",
+      "description": "输入载荷。text 与 media 至少提供其一。",
+      "additionalProperties": false,
+      "properties": {
+        "text": { "type": ["string", "null"] },
+        "media": {
+          "type": "array",
+          "description": "媒体引用。v1 中调度层自带 POST /v1/media 上传端点，故此处只放引用，不放 base64。",
+          "items": { "$ref": "#/$defs/MediaRef" }
+        }
+      },
+      "anyOf": [
+        { "required": ["text"], "properties": { "text": { "type": "string", "minLength": 1 } } },
+        { "required": ["media"], "properties": { "media": { "minItems": 1 } } }
+      ]
+    },
+    "declared": {
+      "type": "object",
+      "description": "调用方对本次请求的显式声明。这是唯一的合法快捷路径，且是结构化信号——不得用关键词匹配来替代它。",
+      "additionalProperties": false,
+      "properties": {
+        "intent": {
+          "type": ["string", "null"],
+          "description": "调用方声明的意图，取值应来自 config/taxonomy.yaml。"
+        },
+        "capability": {
+          "type": ["string", "null"],
+          "description": "调用方声明的能力，取值应来自已注册 handler 的 capabilities。"
+        },
+        "authoritative": {
+          "type": "boolean",
+          "default": false,
+          "description": "true 表示调用方断言自己已知类型，据此可跳过评估（是否真的跳过由策略 routes[].evaluate 决定）。false 时上面的声明只作为待验证的提示，不作为事实。"
+        }
+      }
+    },
+    "constraints": {
+      "type": "object",
+      "description": "本次请求的硬约束。与策略取交集，取更严者。",
+      "additionalProperties": false,
+      "properties": {
+        "mode_preference": {
+          "type": "string",
+          "enum": ["auto", "sync", "async"],
+          "default": "auto"
+        },
+        "max_cost": {
+          "type": ["number", "null"],
+          "minimum": 0,
+          "description": "单任务成本上限。注意：是否真的中断由策略 budget.enforcement.mode 决定，默认 advisory（只记账与告警，不中断）。"
+        },
+        "max_wall_ms": { "type": ["integer", "null"], "minimum": 1 },
+        "allowed_model_tiers": {
+          "type": ["array", "null"],
+          "description": "允许使用的模型档位名。档位名是配置性词表（见 config/routing.policy.yaml 的 model_tiers），故此处不设 enum，由 PolicyGuard 校验成员资格。",
+          "items": { "type": "string" }
+        },
+        "data_sensitivity": {
+          "type": "string",
+          "enum": ["public", "internal", "personal", "financial"],
+          "description": "影响可选用路由（如金融数据不得选择会把原图外发的路由）与审计留存策略。"
+        }
+      }
+    },
+    "client": {
+      "type": "object",
+      "description": "调用方自述，用于兼容性与能力协商。",
+      "additionalProperties": false,
+      "properties": {
+        "app": { "type": "string", "description": "如 bookkeeping / calendar / duowei。" },
+        "app_version": { "type": "string" },
+        "min_supported_client_version": { "type": ["string", "null"] },
+        "supports_sse": { "type": "boolean", "default": true },
+        "supports_last_event_id": {
+          "type": "boolean",
+          "default": false,
+          "description": "客户端是否支持用 Last-Event-ID 断线重放。移动端应置 true。"
+        }
+      }
+    },
+    "metadata": {
+      "type": "object",
+      "description": "调用方透传字段，调度层原样存储不解读。",
+      "additionalProperties": true
+    }
+  },
+  "$defs": {
+    "MediaRef": {
+      "type": "object",
+      "description": "对调度层媒体存储中一个对象的引用。",
+      "required": ["media_id", "kind", "mime"],
+      "additionalProperties": false,
+      "properties": {
+        "media_id": { "type": "string", "description": "由 POST /v1/media 返回。" },
+        "kind": { "type": "string", "enum": ["image", "audio", "pdf", "document"] },
+        "mime": { "type": "string", "description": "如 image/png。必须与上传时声明一致。" },
+        "bytes": { "type": ["integer", "null"], "minimum": 0 },
+        "sha256": {
+          "type": ["string", "null"],
+          "pattern": "^[a-f0-9]{64}$",
+          "description": "内容哈希。用于跨设备去重与幂等判定，避免同一张截图重复入账。"
+        },
+        "role": {
+          "type": ["string", "null"],
+          "description": "调用方对媒体角色的提示，如 source_document / screenshot / photo。",
+          "enum": ["source_document", "screenshot", "photo", "audio_note", null]
+        },
+        "capabilities": {
+          "type": ["array", "null"],
+          "items": { "type": "string" },
+          "description": "调用方自述该媒体需要的能力，如 vision.extract。仅作提示。"
+        }
+      }
+    }
+  }
+}

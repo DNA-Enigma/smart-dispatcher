@@ -1,0 +1,26 @@
+# =============================================================================
+# 已注册的 handler
+# =============================================================================
+# **新增一个领域 = 加一个目录 + 在这里加一条。** 调度层的代码一行都不用改，
+# 这是接缝的验收标准（`tests/test_handler_seam.py` 会机械地证明它）。
+#
+# 每个 handler 是一对：
+#   manifest  声明（能力、工具、流程、config schema）——调度层的决策与校验只依赖它
+#   impl      可执行实现的导入路径，形如 `包.模块:类名`
+#
+# `impl` 可以留空：那样这个 handler 只有声明、没有实现。这不是半成品，
+# 而是一种有用的状态——评估器能看见它的能力（于是能正确判断请求该由谁承接），
+# 而执行会明确地报 "handler_not_implemented"。缺实现时报错，比假装能做更好。
+#
+# 你自己的应用有两种接入方式：
+#   1. 在这里加一条，impl 指向你项目里的类（构造函数不接受额外参数，用内置存储）；
+#   2. 在代码里构造好带依赖的实例，通过 `DispatcherConfig(handlers=[...])` 注入
+#      （需要接你自己的数据库时走这条，见 docs/07-handler-seam.md）。
+# =============================================================================
+
+handlers:
+  - manifest: handlers/bookkeeping/handler.yaml
+    impl: handlers.bookkeeping.handler:BookkeepingHandler
+
+  - manifest: handlers/calendar/handler.yaml
+    impl: handlers.calendar.handler:CalendarHandler

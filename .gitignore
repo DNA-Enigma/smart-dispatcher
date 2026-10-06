@@ -1,0 +1,30 @@
+# 密钥。.env 永远不进版本控制。
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 本地运行产物
+data/
+*.db
+*.sqlite3
+logs/
+.artifacts/
+
+# 编辑器
+.idea/
+.vscode/
+*.swp
+.DS_Store

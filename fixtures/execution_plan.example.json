@@ -1,0 +1,103 @@
+{
+  "plan_version": "1.1",
+  "task_id": "task_01J8ZQ5N7P",
+  "strategy": "dag",
+  "source": "flow_template:receipt_to_entry",
+  "max_parallelism": 3,
+  "revision": 1,
+  "nodes": [
+    {
+      "subtask_id": "extract",
+      "name": "抽取票据字段",
+      "handler": "bookkeeping",
+      "executor": "agent",
+      "role": "receipt_extractor",
+      "tool_whitelist": ["extract_receipt_fields", "crop_and_zoom", "read_media_region"],
+      "max_rounds": 4,
+      "on_round_limit": "escalate_and_retry",
+      "depends_on": [],
+      "inputs": {
+        "media_ref": { "$ref": "envelope.input.media[0].media_id" },
+        "text_hint": { "$ref": "envelope.input.text" }
+      },
+      "output_schema_ref": "bookkeeping.ReceiptFields",
+      "model_tier": null,
+      "required_capabilities": ["vision.extract", "text"],
+      "timeout_ms": 20000,
+      "retry": { "max": 1, "backoff_ms": 500 },
+      "idempotent": true,
+      "optional": false,
+      "verification": null,
+      "on_failure": "fail_task"
+    },
+    {
+      "subtask_id": "normalize",
+      "name": "商户归类",
+      "handler": "bookkeeping",
+      "executor": "agent",
+      "role": "merchant_classifier",
+      "tool_whitelist": ["lookup_merchant", "query_ledger", "list_categories"],
+      "max_rounds": 3,
+      "depends_on": ["extract"],
+      "inputs": { "merchant_raw": { "$ref": "extract.merchant" } },
+      "output_schema_ref": "bookkeeping.Merchant",
+      "model_tier": "cheap",
+      "required_capabilities": ["text"],
+      "timeout_ms": 8000,
+      "idempotent": true,
+      "optional": false,
+      "on_failure": "fail_task"
+    },
+    {
+      "subtask_id": "dedupe",
+      "name": "重复检查",
+      "handler": "bookkeeping",
+      "executor": "tool",
+      "tool": "dedupe_check",
+      "depends_on": ["extract"],
+      "inputs": { "fields": { "$ref": "extract" }, "lookback_days": 3 },
+      "output_schema_ref": "bookkeeping.DedupeResult",
+      "model_tier": null,
+      "required_capabilities": [],
+      "timeout_ms": 3000,
+      "idempotent": true,
+      "optional": true,
+      "on_failure": "continue_with_default",
+      "default_output": { "duplicate": false, "matched_entry_id": null }
+    },
+    {
+      "subtask_id": "write",
+      "name": "写入账本",
+      "handler": "bookkeeping",
+      "executor": "tool",
+      "tool": "build_ledger_entry",
+      "depends_on": ["normalize", "dedupe"],
+      "inputs": {
+        "fields": { "$ref": "extract" },
+        "merchant": { "$ref": "normalize" },
+        "duplicate_checked": { "$ref": "dedupe" }
+      },
+      "output_schema_ref": "bookkeeping.LedgerEntry",
+      "model_tier": null,
+      "required_capabilities": [],
+      "timeout_ms": 5000,
+      "idempotent": true,
+      "optional": false,
+      "on_failure": "fail_task"
+    }
+  ],
+  "edges": [
+    { "from": "extract", "to": "normalize" },
+    { "from": "extract", "to": "dedupe" },
+    { "from": "normalize", "to": "write" },
+    { "from": "dedupe", "to": "write" }
+  ],
+  "join": {
+    "write": ["normalize", "dedupe"]
+  },
+  "plan_budget": {
+    "max_cost": 0.05,
+    "max_wall_ms": 30000,
+    "max_llm_calls": 8
+  }
+}

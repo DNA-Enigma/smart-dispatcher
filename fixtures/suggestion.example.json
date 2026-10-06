@@ -1,0 +1,51 @@
+{
+  "suggestion_id": "sg_01J8ZR2T4W",
+  "created_at": "2026-10-06T03:00:00Z",
+  "scope": {
+    "level": "user",
+    "tenant_id": "default",
+    "user_id": "u_123"
+  },
+  "analysis_window": {
+    "from": "2026-09-29T00:00:00+08:00",
+    "to": "2026-10-06T00:00:00+08:00"
+  },
+  "sample_size": 412,
+  "basis_policy_version": "pv_2026-10-01_03",
+  "kind": "route_guidance_patch",
+  "target": {
+    "artifact": "routing.policy.yaml",
+    "path": "routes[direct_answer].when",
+    "current": "单步、无副作用、不需要外部事实或用户私有数据即可回答的请求（解释、改写、闲聊、常识问答）。",
+    "proposed": "单步、无副作用、不需要外部事实或用户私有数据即可回答的请求（解释、改写、闲聊、常识问答）。凡涉及查询本人流水、余额、持仓或任何用户私有账目数据，一律不得选择本路由——这类请求必须走需要 handler 的路由。"
+  },
+  "evidence": {
+    "metric": "guard_overrule_rate",
+    "before": 0.19,
+    "after_estimate": 0.05,
+    "affected_run_ids": ["run_01J8ZP11", "run_01J8ZP29", "run_01J8ZP41"],
+    "distinct_users_affected": 1,
+    "counterfactual": "近 7 天该用户 37 次『我上个月花了多少』类提问中，有 7 次被判为 direct_answer，随后被守卫改判或用户重问，实质是 when 描述漏掉了『查询本人私有数据』这一条。"
+  },
+  "rationale": "direct_answer 的 when 只说了『不需要外部事实』，没说『不需要用户私有数据』，导致『查本人账目』这类请求被吸进来。补上这一句即可，不改任何阈值与档位。",
+  "confidence": 0.74,
+  "risk": "low",
+  "blast_radius": ["route:direct_answer"],
+  "guards": {
+    "locked_path": false,
+    "delta_within_limit": true,
+    "sample_ok": true,
+    "type_match": true,
+    "path_exists": true,
+    "notes": ["when 为散文字段，不适用数值幅度限制"]
+  },
+  "rollback": {
+    "method": "policy_version_rollback",
+    "to_version": "pv_2026-10-01_03"
+  },
+  "status": "proposed",
+  "decided_by": null,
+  "decided_at": null,
+  "decision_note": null,
+  "resulting_policy_version": null
+}

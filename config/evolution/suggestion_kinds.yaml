@@ -1,0 +1,103 @@
+# =============================================================================
+# 建议类型词表（封闭集）
+# =============================================================================
+# 系统能提出的改进，种类是有限的——这是"自进化只改配置与提示词，永不改代码"
+# 的落地方式。04 的输出被约束在本文件的形状之内，所以即使分析提示词被注入成功，
+# 它能产出的也只是"某个白名单配置键的某个合法取值"，而不是可执行的东西。
+#
+# 新增一种可调项的正确做法是：先在这里加一条，同时让对应配置键在代码里被读取
+# （一次性的、由开发者写的、经评审的代码改动），而不是让进化循环去写代码。
+#
+# 每条声明：target_artifact 允许的产物、value_type 取值类型、delta 规则。
+# =============================================================================
+
+kinds_version: "1.0"
+
+kinds:
+  - id: threshold_change
+    description: 调整某个数值阈值或上限。
+    target_artifact: [routing.policy.yaml]
+    value_type: number
+    delta_rule: ratio          # 变化幅度受 evolution.max_delta_ratio 约束
+    example: "routes[vision_extract_then_write].max_cost 由 0.08 下调至 0.05"
+
+  - id: route_guidance_patch
+    description: 重写某条路由的 when 散文，使 LLM 的判定与实际流量对齐。
+    target_artifact: [routing.policy.yaml]
+    value_type: string
+    delta_rule: none           # 散文不适用幅度限制，靠人审
+    example: "direct_answer 的 when 补上『涉及用户私有账目数据不得选本路由』"
+
+  - id: tier_change
+    description: 调整某条路由的默认档位或允许档位集合。
+    target_artifact: [routing.policy.yaml]
+    value_type: string
+    delta_rule: enum_membership  # 新值必须是 model_tiers 的键
+    example: "multi_step_analysis 的 default_tier 由 strong 降为 standard"
+
+  - id: tool_set_change
+    description: 收窄或放宽某条路由的工具白名单。
+    target_artifact: [routing.policy.yaml]
+    value_type: string
+    delta_rule: subset_of_handler_tools
+    example: "收紧某路由的 tool_policy，去掉从不被调用的写操作工具"
+
+  - id: flow_template_add
+    description: 新增一个具名流程模板，固化反复出现的拆解形状。
+    target_artifact: [flow_templates]
+    value_type: object
+    delta_rule: additive_only
+    example: "为反复出现的 monthly_reconciliation 形状新增模板"
+
+  - id: prompt_patch
+    description: 修改评估器/路由器/拆解器的系统提示词。
+    target_artifact:
+      - prompts/evaluator.md
+      - prompts/router.md
+      - prompts/decomposer.md
+    value_type: string
+    delta_rule: none
+    # 分析提示词自身在 routing.policy.yaml 的 evolution.locked_prompts 中，不可被本类修改。
+    example: "在 decomposer 提示词中补充『纯算术步骤不得要求 LLM 能力』"
+
+  - id: taxonomy_add
+    description: 向任务类型词表追加一类意图。只增不改不删。
+    target_artifact: [taxonomy.yaml]
+    value_type: object
+    delta_rule: additive_only
+    example: "新增 bookkeeping.investment.dividend"
+
+  - id: validator_relaxation
+    description: 放宽 handler 的输入/输出 schema，使其不再比工具本身更严格。
+    target_artifact: [handler.schema]
+    value_type: object
+    delta_rule: relax_only     # 只允许放宽必填与取值范围，不允许新增约束
+    example: "build_ledger_entry 的 output schema 中 memo 字段改为非必填"
+
+# 这些产物永远不可作为任何 kind 的 target，出现即判定为非法建议并丢弃。
+#
+# 这份清单必须与 routing.policy.yaml 的 locked_paths 覆盖同样的范围——
+# 两处作用不同（这里是给分析提示词与人工审查看的，locked_paths 由守卫在运行时强制），
+# 因此任何一处漏掉都会形成一条"运行时拦得住、但分析环节看不见"的缝。
+# tests/test_config_consistency.py 会强制两者对齐。
+forbidden_target_artifacts:
+  # 代码
+  - "dispatcher/core/**"
+  - "dispatcher/stages/**"
+  - "dispatcher/interface/**"
+  - "**/*.py"
+  - "**/*.ts"
+  - "**/*.dart"
+  # 价格来自供应商，不是能"学"出来的
+  - "pricing.yaml"
+  # 资源与安全硬边界
+  - "config/routing.policy.yaml#limits.*"
+  # 出问题时的最后保障
+  - "config/routing.policy.yaml#fallback"
+  # 不允许自我放宽
+  - "config/routing.policy.yaml#evolution.*"
+  # 多 Agent 不会失控的保证
+  - "config/agents.yaml#hard_bounds"
+  # 模型与供应商的绑定关系
+  - "config/routing.policy.yaml#model_tiers.*.provider"
+  - "config/routing.policy.yaml#model_tiers.*.model_ref"

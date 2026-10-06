@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://smart-dispatcher.dev/schemas/problem.json",
+  "title": "Problem",
+  "description": "RFC 9457 风格的结构化错误体。契约要求错误是有类型、可传播的：实现不得把上游异常吞成字符串哨兵再拼进正文（现有 duowei-ai backend/app/core/llm_client.py::llm_chat 的 '[DeepSeek错误] HTTP 500' 正是反例）。",
+  "type": "object",
+  "required": ["type", "title", "status", "code", "retryable", "request_id"],
+  "additionalProperties": false,
+  "properties": {
+    "type": {
+      "type": "string",
+      "format": "uri",
+      "description": "错误类型的稳定 URI，形如 https://smart-dispatcher/errors/<code>。"
+    },
+    "title": {
+      "type": "string",
+      "description": "面向人的一句话摘要，可直接展示。"
+    },
+    "status": {
+      "type": "integer",
+      "minimum": 400,
+      "maximum": 599,
+      "description": "HTTP 状态码，与 code 一一对应。"
+    },
+    "code": {
+      "type": "string",
+      "description": "机器可判定的错误码。这是封闭词表：新增错误码属于契约变更。",
+      "enum": [
+        "invalid_request",
+        "unsupported_media",
+        "media_too_large",
+        "idempotency_conflict",
+        "no_capability_match",
+        "budget_exceeded",
+        "policy_violation",
+        "handler_error",
+        "upstream_llm_error",
+        "timeout",
+        "cancelled",
+        "rate_limited",
+        "not_found",
+        "result_not_ready"
+      ]
+    },
+    "detail": {
+      "type": "string",
+      "description": "针对本次错误的具体说明，含发生位置与观测值。"
+    },
+    "retryable": {
+      "type": "boolean",
+      "description": "true 时客户端才应重试。内部重试上限由策略配置约束，不由本字段决定。"
+    },
+    "request_id": {
+      "type": "string",
+      "description": "用于跨服务追踪；即使请求被拒也必须有。"
+    },
+    "task_id": {
+      "type": ["string", "null"],
+      "description": "已创建任务时给出，便于客户端转为订阅事件流。"
+    },
+    "retry_after_ms": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "仅 retryable=true 时有意义；与 Retry-After 头一致。"
+    },
+    "context": {
+      "type": "object",
+      "description": "错误的结构化上下文，键随 code 而异（如 budget_exceeded 给出 spent/limit/scope）。",
+      "additionalProperties": true
+    }
+  }
+}

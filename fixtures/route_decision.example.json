@@ -1,0 +1,38 @@
+{
+  "decision_version": "1.0",
+  "policy_version": "pv_2026-10-01_03",
+  "route_id": "vision_extract_then_write",
+  "path": "decompose",
+  "model_tier": "standard",
+  "vision_tier": "standard",
+  "handler": "bookkeeping",
+  "tool_set": [
+    "extract_receipt_fields",
+    "normalize_merchant",
+    "dedupe_check",
+    "build_ledger_entry"
+  ],
+  "execution_mode": "async",
+  "decompose": true,
+  "parallelism_hint": 2,
+  "budget": {
+    "max_cost": 0.05,
+    "max_wall_ms": 30000,
+    "max_llm_calls": 8
+  },
+  "escalation_rule": {
+    "on": ["schema_validation_failed", "low_quality"],
+    "to_tier": "strong",
+    "max_escalations": 1
+  },
+  "rationale": "含支付截图，需视觉抽取后落账；去重依赖抽取结果，步骤间有依赖，故走 decompose 异步。",
+  "confidence": 0.83,
+  "guard": {
+    "applied": ["budget_clamped"],
+    "original_tier": null,
+    "original_route_id": "vision_extract_then_write",
+    "original_mode": "async",
+    "fallback_used": false,
+    "violations": []
+  }
+}

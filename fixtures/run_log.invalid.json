@@ -1,0 +1,26 @@
+{
+  "run_id": "run_bad_01",
+  "task_id": "task_01J8ZQ5N7P",
+  "tenant_id": "default",
+  "user_id": "u_123",
+  "source": "api",
+  "started_at": "2026-10-06T12:00:00Z",
+  "profile": {
+    "task_type": "bookkeeping.capture_from_receipt",
+    "complexity_band": "medium",
+    "confidence": 0.86,
+    "degraded": false
+  },
+  "decision": {
+    "route_id": "vision_extract_then_write",
+    "model_tier": "standard",
+    "path": "decompose",
+    "confidence": 0.83,
+    "guard_applied": [],
+    "fallback_used": false
+  },
+  "outcome": {
+    "status": "succeeded",
+    "wall_ms": 5400
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "type": "https://smart-dispatcher/errors/internal",
+  "title": "Internal server error",
+  "status": 500,
+  "code": "internal_server_error",
+  "detail": "[DeepSeek错误] HTTP 500",
+  "request_id": "req_01J8ZQ4K2M"
+}

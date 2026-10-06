@@ -1,0 +1,46 @@
+{
+  "request_id": "req_01J8ZQ4K2M",
+  "idempotency_key": "bookkeeping:u_123:sha256-3f9a1c7e",
+  "identity": {
+    "tenant_id": "default",
+    "user_id": "u_123",
+    "locale": "zh-CN",
+    "timezone": "Asia/Shanghai"
+  },
+  "input": {
+    "text": "中午吃饭花了 38",
+    "media": [
+      {
+        "media_id": "m_01J8ZQ3A",
+        "kind": "image",
+        "mime": "image/png",
+        "bytes": 284310,
+        "sha256": "3f9a1c7e2b4d8f0a6c1e5b9d3a7f2c8e4b0d6a1f9c3e7b5d2a8f4c0e6b3d9a7f",
+        "role": "source_document",
+        "capabilities": ["vision.extract"]
+      }
+    ]
+  },
+  "declared": {
+    "intent": null,
+    "capability": null,
+    "authoritative": false
+  },
+  "constraints": {
+    "mode_preference": "auto",
+    "max_cost": 0.05,
+    "max_wall_ms": 30000,
+    "allowed_model_tiers": ["cheap", "standard", "strong"],
+    "data_sensitivity": "financial"
+  },
+  "client": {
+    "app": "bookkeeping",
+    "app_version": "0.3.1",
+    "supports_sse": true,
+    "supports_last_event_id": true
+  },
+  "metadata": {
+    "device": "ios-18.2",
+    "entry_point": "photo_picker"
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://smart-dispatcher.dev/schemas/bookkeeping_dedupe_result.json",
+  "title": "bookkeeping.DedupeResult",
+  "description": "`dedupe_check` 的产出：这笔往来是否已经在账本里。\n\n查重是**可选步骤**（模板里 `optional: true` + `continue_with_default`）：查重失败也照样入账，默认按\"未重复\"继续。不这样做的话，一个查重服务的短暂故障会阻断所有记账。",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "duplicate": { "type": "boolean", "description": "是否已存在同一笔。" },
+    "matched_entry_id": { "type": ["string", "null"], "description": "命中的账目 id；未重复时为 null。" }
+  },
+  "required": ["duplicate"]
+}
