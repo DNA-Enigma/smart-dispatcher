@@ -85,7 +85,19 @@ class StateStorePort(Protocol):
     # -- 幂等 ------------------------------------------------------------
     async def get_idempotency(self, key: str, tenant_id: str) -> str | None: ...
 
-    async def put_idempotency(self, key: str, tenant_id: str, task_id: str) -> None: ...
+    async def put_idempotency(self, key: str, tenant_id: str, task_id: str) -> None:
+        """登记 ``(key, tenant_id) → task_id``。同键重复登记时**覆盖**。
+
+        覆盖是刻意的，而且**调用方必须先做过判定**（``Dispatcher.submit`` 在命中
+        时比对请求内容，不同就 409，根本不走到这里）。会走到覆盖的只有一种情形：
+        键上记着的那个任务已经不在库里了（记录被清理），此时把映射改指到新任务是
+        正确行为——改成"不覆盖"反而会让这个键永远指向一个不存在的任务，于是每次
+        重试都新建一个任务，幂等彻底失效。
+
+        **租户是键空间的一部分，且租户来自 token（不再由客户端自报）**，因此
+        "换个租户自报就能覆盖别人的键"这条路不存在。
+        """
+        ...
 
 
 __all__ = ["StateStorePort"]

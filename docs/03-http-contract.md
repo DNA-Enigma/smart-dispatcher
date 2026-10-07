@@ -22,6 +22,7 @@
 | `POST` | `/v1/media` | 上传媒体 |
 | `GET` | `/v1/media/{id}` | 取回媒体 |
 | `GET` | `/v1/capabilities` | 已注册 handler 与工具的自省 |
+| `GET` | `/v1/agents` | 角色定义与硬边界的自省 |
 | `GET` | `/v1/policy` | 当前生效策略 |
 | `GET` | `/v1/policy/versions` | 版本历史 |
 | `POST` | `/v1/policy/rollback` | 回滚到指定版本 |
@@ -35,6 +36,36 @@
 关于 `/v1/evolution/*`：它看起来像管理接口，但契约里**不建模 admin 角色**。
 它建模的是"策略范围的所有者"——单用户场景就是使用者本人，多人场景是租户所有者。
 理由见 [06-self-evolve.md](06-self-evolve.md)。
+
+---
+
+## 认证与身份
+
+**除 `/v1/health` 外，每个端点都要 `Authorization: Bearer <token>`**，否则 `401`
+（`code: unauthorized`，并带 `WWW-Authenticate: Bearer`）。`/health` 免鉴权是刻意的：
+监控探针与负载均衡器拿不到 token，也不该为了探活而持有一把万能钥匙。
+
+**令牌由消费端自己的认证体系签发，本契约不提供发放或续期的端点。** 调度层只做
+契约承诺的那一件事：收到 token 后信任它，并据此定下本次请求的 `user_id` 与
+`tenant_id`。它不建用户、不发令牌、不管刷新。参考实现把整串 token 与配置的静态
+密钥（`DISPATCHER_AUTH_TOKEN`）做定长比对，租户与用户由 `DISPATCHER_TENANT` /
+`DISPATCHER_USER` 给出——**这是"实现符合契约的一个实例"，不是契约的一部分**：
+换成解析 JWT 只需改中间件里那一处比对。
+
+**身份只有一个来源：token。** 请求体 `identity.tenant_id` / `identity.user_id`、
+`X-Tenant-Id` / `X-User-Id` 头、query 参数都不被采信（覆盖并记服务端告警，不返回
+400——`identity` 是契约里的必填字段，把它做成错误触发器会让合规客户端集体报错，
+而"服务端不采信自报身份"本身不是错误）。`identity.locale` / `timezone` 是例外，
+它们是展示偏好而非权限，继续由客户端决定。
+
+**跨租户访问一律 `404`，不返回 `403`。** 403 等于确认"这个 id 存在，只是不归你"，
+那本身就是不该给的信息。同理，"媒体不存在"与"媒体不是你的"返回同一个 404——
+两者若给出不同的码（415 / 404），这组码差就成了一个存在性探测器。
+
+对象级授权落在两处：`Dispatcher.get()` 是所有按 id 取资源的**唯一**收口（快照、
+产物、事件流、澄清、反馈、取消都走它），带租户条件后不匹配即 404；媒体归属另在
+接口边界校验，包括**请求体里引用的 media_id**——那条路绕开了
+`GET /v1/media/{id}`，能让评估器把别人的截图取出来送进模型。
 
 ---
 
@@ -73,10 +104,17 @@ Idempotency-Key: bookkeeping:u_123:sha256-3f9a1c7e
 | 同 key + 不同请求体哈希 | `409 idempotency_conflict` |
 | 缺 key，且路由可能命中 `write` 工具 | `400 invalid_request` |
 
+**"同请求体"比的是请求内容，不是这一次传输的包装。** 参与比对的是
+`input` / `declared` / `constraints` / `parent_task_id` / `metadata`；`request_id`
+（每次尝试都会变）、`idempotency_key`（可能一次在体内、一次在 `Idempotency-Key` 头）、
+`identity`（服务端已按 token 覆盖）、`client`（app 版本这类遥测）都不参与——
+否则客户端升个版本或者换个 request_id，一次正常重试就会变成 409。
+
 **必填的判定在路由之后**：请求先被评估与路由，若 `tool_set` 中含 `side_effects: write`
 的工具而没有幂等键，则拒绝。这样既不必让调用方为只读请求也背一个键，也不会漏掉写操作。
 
-键的作用域是 `(key, tenant_id)`，TTL 由配置指定。
+键的作用域是 `(key, tenant_id)`，TTL 由配置指定。租户来自 token（不再是自报），
+因此知道别人的 key 也换不走别人的任务；命中时还会用上面的指纹再比一次请求内容。
 
 ### 写操作的重试安全
 

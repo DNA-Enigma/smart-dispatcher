@@ -18,6 +18,7 @@ from typing import Any, Final
 # code -> (HTTP 状态, 默认是否可重试)
 # 与 schemas/problem.json 的 code 枚举一一对应，顺序也保持一致。
 ERROR_TABLE: Final[dict[str, tuple[int, bool]]] = {
+    "unauthorized": (401, False),
     "invalid_request": (400, False),
     "unsupported_media": (415, False),
     "media_too_large": (413, False),
@@ -35,6 +36,7 @@ ERROR_TABLE: Final[dict[str, tuple[int, bool]]] = {
 }
 
 ERROR_TITLES: Final[dict[str, str]] = {
+    "unauthorized": "Missing or invalid credentials",
     "invalid_request": "Request does not satisfy the schema",
     "unsupported_media": "Unsupported media type",
     "media_too_large": "Media exceeds the size limit",
@@ -66,6 +68,7 @@ _ERROR_TYPE_BASE: Final[str] = "https://smart-dispatcher/errors/"
 #   后者会在任务列表里留下一堆其实从未开始的"失败任务"，污染失败率。
 NON_DEGRADABLE_CODES: Final[frozenset[str]] = frozenset(
     {
+        "unauthorized",
         "policy_violation",
         "no_capability_match",
         "invalid_request",

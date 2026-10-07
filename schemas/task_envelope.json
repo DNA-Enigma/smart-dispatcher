@@ -22,14 +22,14 @@
     },
     "identity": {
       "type": "object",
-      "description": "身份与本地化。配置与进化按 user_id 隔离；tenant_id 为将来组织形态保留。",
+      "description": "身份与本地化。**tenant_id 与 user_id 不构成授权声明**：服务端以 Authorization 头里的 bearer token 为准，请求体里的这两个值会被覆盖（不一致时记一条服务端告警）。它们仍是必填字段，因为客户端本来就知道自己是谁，如实上报有助于对账；而 locale / timezone 表示展示偏好而非权限，继续由客户端决定。",
       "required": ["user_id"],
       "additionalProperties": false,
       "properties": {
-        "tenant_id": { "type": "string", "default": "default" },
-        "user_id": { "type": "string" },
-        "locale": { "type": "string", "description": "BCP 47，如 zh-CN。" },
-        "timezone": { "type": "string", "description": "IANA 时区，如 Asia/Shanghai。影响日报/对账等时间窗口语义。" }
+        "tenant_id": { "type": "string", "default": "default", "description": "自述租户。服务端不采信，实际租户由 token 决定。" },
+        "user_id": { "type": "string", "description": "自述用户。服务端不采信，实际用户由 token 决定。" },
+        "locale": { "type": "string", "description": "BCP 47，如 zh-CN。服务端采信（展示偏好，无授权含义）。" },
+        "timezone": { "type": "string", "description": "IANA 时区，如 Asia/Shanghai。影响日报/对账等时间窗口语义。服务端采信。" }
       }
     },
     "input": {

@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import uuid
 from dataclasses import dataclass
@@ -260,9 +261,11 @@ class Dispatcher:
             record.error = record.error or None
             self.config_warnings.append(f"RunLog 写入失败：{e}")
 
-    async def record_feedback(self, task_id: str, payload: dict) -> dict:
+    async def record_feedback(
+        self, task_id: str, payload: dict, *, tenant_id: str | None = None
+    ) -> dict:
         """人工质量信号。是 04 最有价值的输入——用户的每次修改都给出了真值标注。"""
-        record = await self.get(task_id)
+        record = await self.get(task_id, tenant_id=tenant_id)
         signal = HumanSignal.model_validate(payload)
         record.human_signal = signal.model_dump(mode="json")
         await self._save(record)
@@ -349,6 +352,7 @@ class Dispatcher:
         设计文档里说的也是飞行前投影，不是中途改判。
         """
         rid = request_id or envelope.request_id or f"req_{uuid.uuid4().hex[:12]}"
+        dump = envelope.model_dump(mode="json")
 
         if envelope.idempotency_key:
             existing = await self.state.get_idempotency(
@@ -356,7 +360,25 @@ class Dispatcher:
             )
             if existing:
                 rec = await self.state.get_task(existing)
-                if rec is not None:
+                # 属主不符按"没命中"处理：键空间已经按租户隔离，这一句是兜住
+                # "存储实现没按租户隔离键空间"的可能。
+                if rec is not None and rec.tenant_id == envelope.identity.tenant_id:
+                    # **同一个 key 不代表同一个请求。** 只凭 key 命中就回既有任务，
+                    # 等于让任何知道 key 的人用一次重试换走别人的任务快照
+                    # （键空间按租户隔离后仍需这一层：同租户内 key 也可能撞车）。
+                    # 契约早就写了这条（"同 key + 不同请求体 → 409"），此前从未实现。
+                    if rec.envelope is None or _idempotency_fingerprint(
+                        rec.envelope
+                    ) != _idempotency_fingerprint(dump):
+                        raise DispatcherError(
+                            "idempotency_conflict",
+                            "该幂等键已用于另一个请求体：重放必须原样重发",
+                            task_id=rec.task_id,
+                            context={
+                                "idempotency_key": envelope.idempotency_key,
+                                "existing_task_id": rec.task_id,
+                            },
+                        )
                     return rec
 
         record = TaskRecord(
@@ -369,6 +391,10 @@ class Dispatcher:
             source=source,
             policy_version=self.policy.policy_version,
             budget_enforcement=self.policy.enforcement_mode,
+            # 原始请求要在**落库之前**挂上：幂等命中路径要拿它比对请求体，
+            # 若等 create_task 之后再赋值，两者之间有一个"记录已存在但没有
+            # envelope"的窗口，那时的命中只能无从比对。
+            envelope=dump,
         )
         await self.state.create_task(record)
         await self.events.emit(record.task_id, "task.created",
@@ -378,7 +404,6 @@ class Dispatcher:
                 envelope.idempotency_key, envelope.identity.tenant_id, record.task_id
             )
 
-        record.envelope = envelope.model_dump(mode="json")
         # **提前开通预算**：评估、路由、拆解都发生在计划预算确定之前，
         # 而它们都要花钱。等到有决策了再开通，前面几步的账就丢了。
         # 这里先用每任务默认值，runner 拿到计划后会以计划上限更新它
@@ -724,7 +749,9 @@ class Dispatcher:
         return record
 
     # ------------------------------------------------------------------
-    async def clarify(self, task_id: str, answer: dict) -> TaskRecord:
+    async def clarify(
+        self, task_id: str, answer: dict, *, tenant_id: str | None = None
+    ) -> TaskRecord:
         """回答澄清问题，任务**从断点继续**而不是重跑。
 
         三条路：
@@ -736,7 +763,7 @@ class Dispatcher:
           读到用户答了什么。
         * ``edits`` —— 按节点 id 覆盖上游产出（用户的修改就是真值）。
         """
-        record = await self.get(task_id)
+        record = await self.get(task_id, tenant_id=tenant_id)
         if record.status != "awaiting_clarification":
             raise DispatcherError(
                 "invalid_request",
@@ -812,8 +839,10 @@ class Dispatcher:
             record, envelope, cancel, prior=prior, clarification=reply
         )
 
-    async def cancel(self, task_id: str, *, reason: str = "client_requested") -> TaskRecord:
-        record = await self.get(task_id)
+    async def cancel(
+        self, task_id: str, *, reason: str = "client_requested", tenant_id: str | None = None
+    ) -> TaskRecord:
+        record = await self.get(task_id, tenant_id=tenant_id)
         if record.status in TERMINAL_STATUSES:
             return record
         token = self._cancels.get(task_id)
@@ -829,9 +858,21 @@ class Dispatcher:
         return record
 
     # ------------------------------------------------------------------
-    async def get(self, task_id: str) -> TaskRecord:
+    async def get(self, task_id: str, *, tenant_id: str | None = None) -> TaskRecord:
+        """按 id 取任务；给了 ``tenant_id`` 就一并校验归属。
+
+        归属校验放在这里而不是每个端点各写一遍：``get`` 是按 id 取任务的**唯一**
+        收口（快照、产物、事件流、澄清、反馈、取消全走它），因此放在这里就不存在
+        "新加一个端点忘了校验"这种漏法。
+
+        不匹配一律 ``not_found``：403 等于告诉调用方"这个 id 存在，只是不归你"，
+        而那正是要藏起来的信息。
+
+        ``tenant_id`` 可选是为了不带租户上下文的调用方（内嵌使用、单用户本机模式）
+        仍然可用——**信任边界在接口层**，那里一定有身份。
+        """
         rec = await self.state.get_task(task_id)
-        if rec is None:
+        if rec is None or (tenant_id is not None and rec.tenant_id != tenant_id):
             raise DispatcherError("not_found", f"任务不存在：{task_id}", task_id=task_id)
         return rec
 
@@ -842,6 +883,26 @@ class Dispatcher:
 
     def is_terminal_event_seen(self, task_id: str) -> bool:  # pragma: no cover - 供 SSE 用
         return False
+
+
+# 参与幂等指纹的字段：**请求的内容**，而不是这一次传输的包装。
+#
+# 排除项各有理由：``request_id`` 是每次尝试的关联 id（重试本来就会变）；
+# ``idempotency_key`` 可能一次写在请求体、一次写在 Idempotency-Key 头；
+# ``identity`` 已被服务端按 token 覆盖，客户端自报的那份不参与判定；
+# ``client`` 是 app 版本这类遥测——客户端升个版本不该把重试变成 409。
+_IDEMPOTENCY_FIELDS = ("parent_task_id", "input", "declared", "constraints", "metadata")
+
+
+def _idempotency_fingerprint(envelope_dump: dict[str, Any] | None) -> str:
+    """请求内容的规范化指纹。
+
+    两侧都用这一个函数算：入参是 ``TaskEnvelope.model_dump(mode="json")`` 的结果，
+    与记录里存的那一份同源，因此只要请求内容一致，指纹就一致。
+    """
+    material = {k: (envelope_dump or {}).get(k) for k in _IDEMPOTENCY_FIELDS}
+    canon = json.dumps(material, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(canon.encode("utf-8")).hexdigest()
 
 
 def _problem(code: str, detail: str, task_id: str, request_id: str, **kw) -> dict:

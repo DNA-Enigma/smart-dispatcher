@@ -22,13 +22,16 @@ from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from ..core.contract import TaskEnvelope, wire_dump
+from ..core.contract import Identity, TaskEnvelope, wire_dump
 from ..core.errors import DispatcherError
 from ..core.events import TERMINAL_EVENTS, to_sse, to_sse_heartbeat
 from ..core.execution import ClarificationAnswer
 from ..core.runlog import HumanSignal
+from ..core.settings import get_settings
 from ..core.state import TERMINAL_STATUSES
 from ..pipeline import Dispatcher, describe_config
+from .auth import AuthConfig, BearerAuthMiddleware, request_identity
+from .problems import problem_response
 from .validation import read_body
 
 log = logging.getLogger("dispatcher")
@@ -54,25 +57,39 @@ async def lifespan(app: FastAPI):
         _dispatcher = None
 
 
-def create_app() -> FastAPI:
+def create_app(*, auth: AuthConfig | None = None) -> FastAPI:
+    """构造应用。
+
+    ``auth`` 不传时从 ``Settings`` 读（``.env`` / 环境变量）。显式传入是为了测试
+    能钉住"配了 token 会怎样"而不必去改进程环境——本仓库的 ``.env`` 是开发者的
+    私人物品，测试结论不该随它的内容变化。
+    """
+    if auth is None:
+        auth = AuthConfig.from_settings(get_settings())
+        if not auth.required:
+            # 不静默放行。这条日志是"生产忘了配 token"唯一能自己浮出水面的地方：
+            # 鉴权关掉之后，任何能访问这个端口的人都能读全部任务快照、读别人的
+            # 金融截图、改全局策略——而系统看起来一切正常。
+            log.error(
+                "DISPATCHER_AUTH_TOKEN 未配置：接口鉴权已关闭，"
+                "所有任务、媒体与策略端点对任何可达本端口的人开放。仅限本地开发，"
+                "生产部署必须配置该变量（见 .env.example）。"
+            )
+
     app = FastAPI(
         title="Smart 调度层",
         version="0.2.0",
         summary="评估 → 路由 → 拆解并行执行 → 自进化",
         lifespan=lifespan,
     )
+    # 鉴权挂在这里，而不是逐个端点加依赖：新端点自动被保护。
+    app.add_middleware(BearerAuthMiddleware, config=auth)
 
     # ------------------------------------------------------------------
     @app.exception_handler(DispatcherError)
     async def _dispatcher_error_handler(request: Request, exc: DispatcherError) -> JSONResponse:
         rid = request.headers.get("x-request-id") or ""
-        problem = exc.to_problem(rid)
-        if exc.internal:
-            log.warning("问题 %s（内部：%s）", exc.code, exc.internal)
-        headers: dict[str, str] = {}
-        if exc.retry_after_ms:
-            headers["Retry-After"] = str(max(1, exc.retry_after_ms // 1000))
-        return JSONResponse(status_code=exc.status, content=problem, headers=headers)
+        return problem_response(exc, rid)
 
     # ------------------------------------------------------------------
     # 自省
@@ -148,8 +165,15 @@ def create_app() -> FastAPI:
         }
 
     @app.get("/v1/usage")
-    async def usage(user_id: str | None = None, tenant_id: str = "default") -> dict[str, Any]:
+    async def usage(request: Request, user_id: str | None = None) -> dict[str, Any]:
+        """用量。
+
+        租户**只**来自 token——此前它是个 query 参数，``?tenant_id=受害者`` 就能
+        读到别人的花销。``user_id`` 保留为筛选条件（契约里声明了它），但它只能在
+        调用方自己的租户内选人，越不出授权范围。
+        """
         d = get_dispatcher()
+        tenant_id = request_identity(request).tenant_id
         return {
             "currency": d.ledger.currency,
             "enforcement": d.ledger.enforcement,
@@ -164,7 +188,14 @@ def create_app() -> FastAPI:
     # ------------------------------------------------------------------
     @app.post("/v1/media", status_code=201)
     async def upload_media(request: Request) -> dict[str, Any]:
+        """上传媒体。
+
+        归属取自 token，不再读 ``x-tenant-id``/``x-user-id``——那两个头此前与
+        ``create_task`` 读请求体的口径不一致，同一份身份有两套说法，而两套都是
+        客户端说了算。
+        """
         d = get_dispatcher()
+        identity = request_identity(request)
         body = await request.body()
         if not body:
             raise DispatcherError("invalid_request", "请求体为空")
@@ -173,8 +204,8 @@ def create_app() -> FastAPI:
         retain_days = int(retain_raw) if retain_raw and retain_raw.isdigit() else None
         rec = await d.media.put(
             body, mime,
-            user_id=request.headers.get("x-user-id"),
-            tenant_id=request.headers.get("x-tenant-id") or "default",
+            user_id=identity.user_id,
+            tenant_id=identity.tenant_id,
             retain_days=retain_days,
         )
         return {
@@ -185,12 +216,20 @@ def create_app() -> FastAPI:
         }
 
     @app.get("/v1/media/{media_id}")
-    async def get_media(media_id: str) -> Response:
+    async def get_media(media_id: str, request: Request) -> Response:
+        """取回媒体。**归属不符按不存在处理。**
+
+        此前 ``media.get(media_id)`` 只看 id，不看 ``MediaRecord.tenant_id``——
+        拿到 id 就能读别人的金融截图。这里返回 404 而不是 403：403 等于确认
+        "这个 id 存在，只是不归你"，那本身就是不该给的信息。
+        """
         d = get_dispatcher()
         got = await d.media.get(media_id)
         if got is None:
             raise DispatcherError("not_found", f"媒体不存在或已过保留期：{media_id}")
         blob, rec = got
+        if not _media_belongs_to(rec, request_identity(request)):
+            raise DispatcherError("not_found", f"媒体不存在或已过保留期：{media_id}")
         return Response(content=blob, media_type=rec.mime)
 
     # ------------------------------------------------------------------
@@ -207,6 +246,35 @@ def create_app() -> FastAPI:
                 "invalid_request", f"请求体不符合契约：{e}",
                 context={"schema": "schemas/task_envelope.json"},
             ) from e
+
+        # 身份以 token 为准。**不返回 400**：``identity`` 是契约里的 required 字段，
+        # 合规客户端必然要发；把一个不具授权含义的字段做成错误触发器，会让所有本地
+        # user_id 与 token 绑定身份不同的客户端在升级后集体报错。覆盖 + 告警足够——
+        # 客户端自报从来就不是事实，忽略它没有"错误"可言。
+        identity = request_identity(request)
+        claimed = envelope.identity
+        if claimed.tenant_id != identity.tenant_id or claimed.user_id != identity.user_id:
+            log.warning(
+                "请求自报身份 %s/%s 与 token 身份 %s/%s 不符，已按 token 覆盖",
+                claimed.tenant_id, claimed.user_id, identity.tenant_id, identity.user_id,
+            )
+        envelope = envelope.model_copy(
+            update={
+                "identity": Identity(
+                    tenant_id=identity.tenant_id,
+                    user_id=identity.user_id,
+                    # 本地化是展示偏好，不是授权信息——它继续由客户端说了算。
+                    locale=claimed.locale,
+                    timezone=claimed.timezone,
+                )
+            }
+        )
+
+        # 媒体引用也要过归属校验：否则可以在请求体里引用**别人的** media_id，
+        # 让评估器把那张金融截图取出来送给模型。放在请求边界，且不区分
+        # "不存在"与"不是你的"——两者都必须是同一个 404，否则 415/404 的差
+        # 本身就是"这个 id 存在"的探测器。
+        await _assert_media_owned(d, envelope, identity)
 
         idem = request.headers.get("idempotency-key")
         if idem and not envelope.idempotency_key:
@@ -235,20 +303,31 @@ def create_app() -> FastAPI:
         return JSONResponse(status_code=202, content=_accepted(record))
 
     @app.get("/v1/tasks/{task_id}")
-    async def get_task(task_id: str) -> dict[str, Any]:
-        record = await get_dispatcher().get(task_id)
+    async def get_task(task_id: str, request: Request) -> dict[str, Any]:
+        record = await get_dispatcher().get(
+            task_id, tenant_id=request_identity(request).tenant_id
+        )
         return record.to_snapshot()
 
     @app.get("/v1/tasks")
     async def list_tasks(
-        user_id: str | None = None, tenant_id: str = "default", limit: int = 20
+        request: Request, user_id: str | None = None, limit: int = 20
     ) -> dict[str, Any]:
-        records = await get_dispatcher().list(tenant_id=tenant_id, user_id=user_id, limit=limit)
+        """列出任务。
+
+        租户**只**来自 token。此前它是 query 参数，``?tenant_id=受害者`` 就能枚举
+        别人的任务。``user_id`` 保留（契约里声明了它）但只能在自家租户内选人。
+        """
+        records = await get_dispatcher().list(
+            tenant_id=request_identity(request).tenant_id, user_id=user_id, limit=limit
+        )
         return {"items": [r.to_snapshot() for r in records], "next_cursor": None}
 
     @app.get("/v1/tasks/{task_id}/result")
-    async def get_result(task_id: str) -> dict[str, Any]:
-        record = await get_dispatcher().get(task_id)
+    async def get_result(task_id: str, request: Request) -> dict[str, Any]:
+        record = await get_dispatcher().get(
+            task_id, tenant_id=request_identity(request).tenant_id
+        )
         if record.status not in TERMINAL_STATUSES:
             raise DispatcherError(
                 "result_not_ready", f"任务尚未到达终态（当前 {record.status}）",
@@ -267,7 +346,9 @@ def create_app() -> FastAPI:
             request, ClarificationAnswer,
             required=("question_id",), endpoint="POST /v1/tasks/{task_id}/clarify",
         )
-        record = await get_dispatcher().clarify(task_id, body)
+        record = await get_dispatcher().clarify(
+            task_id, body, tenant_id=request_identity(request).tenant_id
+        )
         return record.to_snapshot()
 
     @app.post("/v1/tasks/{task_id}/feedback")
@@ -283,12 +364,16 @@ def create_app() -> FastAPI:
         # 不再用 ``except Exception`` 兜底转 400：请求形状已在校验层挡下，此处剩下的
         # 都是真实结果——任务不存在是 **404**，不是"反馈格式不符"。此前那把兜底伞把
         # 404 也压成了 400，与 openapi.yaml 为 feedback 声明的响应矛盾。
-        signal = await get_dispatcher().record_feedback(task_id, body)
+        signal = await get_dispatcher().record_feedback(
+            task_id, body, tenant_id=request_identity(request).tenant_id
+        )
         return {"task_id": task_id, "human_signal": signal}
 
     @app.post("/v1/tasks/{task_id}/cancel")
-    async def cancel(task_id: str) -> Response:
-        await get_dispatcher().cancel(task_id)
+    async def cancel(task_id: str, request: Request) -> Response:
+        await get_dispatcher().cancel(
+            task_id, tenant_id=request_identity(request).tenant_id
+        )
         return Response(status_code=204)
 
     # ------------------------------------------------------------------
@@ -323,22 +408,27 @@ def create_app() -> FastAPI:
         }
 
     @app.post("/v1/evolution/analyze")
-    async def trigger_analysis() -> dict[str, Any]:
+    async def trigger_analysis(request: Request) -> dict[str, Any]:
         """手动触发一次分析。正常由定时任务按 analysis_interval 跑。"""
         d, loop = _require_evolution()
         await loop.bootstrap()
-        outcome = await loop.run_pass(tenant_id="default")
+        outcome = await loop.run_pass(tenant_id=request_identity(request).tenant_id)
         return outcome.to_wire()
 
     @app.post("/v1/evolution/suggestions/{suggestion_id}/approve")
     async def approve_suggestion(suggestion_id: str, request: Request) -> dict[str, Any]:
+        """批准建议，并**热换策略**。
+
+        这是全仓最危险的一个端点：它能在运行中改掉全局策略（路由、价格、限额），
+        而此前它既无鉴权、审批人还能在请求体里随便填——事后审计看到的
+        "谁批的"完全不可信。现在鉴权由中间件兜住，审批人只能用 token 绑定的身份。
+        """
         d, loop = _require_evolution()
+        identity = request_identity(request)
         body = await request.json() if await request.body() else {}
-        # 审批人 = 使用者本人。请求里可以显式带上是谁，缺省就是任务的用户。
-        approved_by = str(body.get("approved_by") or request.headers.get("x-user-id") or "owner")
         version = await loop.approve(
             suggestion_id,
-            approved_by=approved_by,
+            approved_by=identity.user_id,
             scope=body.get("scope"),
             note=body.get("note"),
         )
@@ -356,12 +446,13 @@ def create_app() -> FastAPI:
     @app.post("/v1/evolution/suggestions/{suggestion_id}/reject")
     async def reject_suggestion(suggestion_id: str, request: Request) -> dict[str, Any]:
         _, loop = _require_evolution()
+        identity = request_identity(request)
         body = await request.json()
         if not body.get("reason"):
             raise DispatcherError("invalid_request", "拒绝必须给出理由——理由本身是信号")
         updated = await loop.reject(
             suggestion_id, reason=str(body["reason"]),
-            decided_by=str(body.get("decided_by") or "owner"),
+            decided_by=identity.user_id,
         )
         return {"suggestion_id": suggestion_id, "status": updated["status"]}
 
@@ -395,7 +486,8 @@ def create_app() -> FastAPI:
     @app.get("/v1/tasks/{task_id}/events")
     async def stream_events(task_id: str, request: Request) -> StreamingResponse:
         d = get_dispatcher()
-        record = await d.get(task_id)  # 不存在就 404，而不是挂一个永远不发事件的连接
+        # 不存在就 404，而不是挂一个永远不发事件的连接；不是自己的任务同样按不存在处理
+        record = await d.get(task_id, tenant_id=request_identity(request).tenant_id)
 
         last = request.headers.get("last-event-id") or request.query_params.get("since")
         since = int(last) if last and str(last).isdigit() else 0
@@ -470,6 +562,36 @@ def create_app() -> FastAPI:
         )
 
     return app
+
+
+def _media_belongs_to(rec, identity) -> bool:
+    """媒体是否属于本次请求的身份。
+
+    采用 fail-closed：记录没写归属（``tenant_id is None``）也判为**不属于**。
+    ``MediaRecord.tenant_id`` 是 ``MediaStorePort`` 定义的字段，参考实现的
+    ``POST /v1/media`` 一定写入它；一个不记录归属的存储实现没有能力参与授权判定，
+    此时让请求明确失败，比放行一个无法证明归属的对象好。
+    """
+    return rec.tenant_id is not None and rec.tenant_id == identity.tenant_id
+
+
+async def _assert_media_owned(d, envelope: TaskEnvelope, identity) -> None:
+    """校验请求体里引用的每一个 media_id 都属于本次请求的身份。
+
+    **不校验的话，越权读取绕过了 ``GET /v1/media/{id}`` 那一道**：把别人的
+    media_id 放进 ``input.media``，评估器会把它取出来送进模型——金融截图就这样
+    出了门，而调用方一个字节的媒体内容都没碰过。
+
+    "不存在"与"不是你的"返回**同一个** 404：两者若给出不同的码，探测者就能用
+    一连串 media_id 问出"哪些 id 真实存在"。
+    """
+    for ref in envelope.input.media or []:
+        rec = await d.media.stat(ref.media_id)
+        if rec is None or not _media_belongs_to(rec, identity):
+            raise DispatcherError(
+                "not_found", f"媒体不存在或已过保留期：{ref.media_id}",
+                context={"media_id": ref.media_id},
+            )
 
 
 def _accepted(record) -> dict[str, Any]:

@@ -32,20 +32,29 @@ class _Snapshot:
 
 
 class _FakeDispatcher:
-    """只记录"流水线收到了什么"，不执行任何调度语义——本文件测的是校验层。"""
+    """只记录"流水线收到了什么"，不执行任何调度语义——本文件测的是校验层。
+
+    ``tenant_id`` 是关键字参数：端点现在把 token 身份一起传下去（跨租户按不存在
+    处理），替身要跟得上真实签名，否则测的是"签名对不对"而不是"校验对不对"。
+    """
 
     def __init__(self) -> None:
         self.clarify_calls: list[dict] = []
         self.feedback_calls: list[dict] = []
+        self.tenant_ids: list[str | None] = []
 
-    async def clarify(self, task_id: str, body: dict) -> _Snapshot:
+    async def clarify(self, task_id: str, body: dict, *, tenant_id: str | None = None) -> _Snapshot:
         self.clarify_calls.append(body)
+        self.tenant_ids.append(tenant_id)
         return _Snapshot()
 
-    async def record_feedback(self, task_id: str, body: dict) -> dict:
+    async def record_feedback(
+        self, task_id: str, body: dict, *, tenant_id: str | None = None
+    ) -> dict:
         if task_id == "missing":
             raise DispatcherError("not_found", f"任务不存在：{task_id}", task_id=task_id)
         self.feedback_calls.append(body)
+        self.tenant_ids.append(tenant_id)
         return {"verdict": body.get("verdict")}
 
 

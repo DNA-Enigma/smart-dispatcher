@@ -26,6 +26,7 @@
       "type": "string",
       "description": "机器可判定的错误码。这是封闭词表：新增错误码属于契约变更。",
       "enum": [
+        "unauthorized",
         "invalid_request",
         "unsupported_media",
         "media_too_large",

@@ -49,6 +49,16 @@ class Settings(BaseSettings):
     llm_standard_model: str = ""
     llm_strong_model: str = ""
 
+    # ---- 接口鉴权。----
+    # 静态共享 token。契约声明了 bearerAuth 但没有发放/续期端点（那是消费端
+    # 认证体系的事），因此参考实现只做一件事：比对。空值表示**鉴权关闭**，
+    # 只用于本地开发，启动时会打一条 ERROR 级日志。
+    dispatcher_auth_token: str = ""
+    # 这个 token 绑定到哪个租户/用户。单 token 部署下身份就是一个常量——
+    # 不为多租户抽象新模型，那是"消费端 IdP 签发带身份的 token"之后的事。
+    dispatcher_tenant: str = "default"
+    dispatcher_user: str = "owner"
+
     # 调用的硬边界。与 routing.policy.yaml 的 limits 是两回事：
     # 那些是策略（可被建议修改），这些是进程级的自保（不可被任何东西改）。
     llm_request_timeout_s: float = 60.0

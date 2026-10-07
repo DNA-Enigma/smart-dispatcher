@@ -15,7 +15,7 @@ from dispatcher.core.policy import Policy, load_policy
 from dispatcher.core.pricing import Pricing, load_pricing
 from dispatcher.core.prompts import PromptLibrary
 from dispatcher.core.registry import HandlerRegistry
-from dispatcher.core.settings import REPO_ROOT, Settings
+from dispatcher.core.settings import REPO_ROOT, Settings, get_settings
 from dispatcher.core.taxonomy import Taxonomy, load_taxonomy
 from dispatcher.plugins import build_registry
 
@@ -73,6 +73,24 @@ def settings() -> Settings:
         llm_standard_model="test-standard",
         llm_strong_model="test-strong",
     )
+
+
+@pytest.fixture(autouse=True)
+def _auth_off_by_default(monkeypatch: pytest.MonkeyPatch):
+    """整套测试默认在**鉴权关闭**下跑。
+
+    显式把 ``DISPATCHER_AUTH_TOKEN`` 置空，而不是"指望它没被配置"：``.env`` 是
+    开发者的私人物品（已被 gitignore），里头有没有 token 不该决定本仓测试是绿是红。
+    空值会覆盖 ``.env`` 里的值（环境变量优先级高于 dotenv 文件），因此结论只取决于
+    这一行。
+
+    需要"配了 token 会怎样"的用例，用 ``create_app(auth=AuthConfig(...))`` 显式注入
+    （见 tests/test_auth.py），不依赖环境，也就不受这个 fixture 影响。
+    """
+    monkeypatch.setenv("DISPATCHER_AUTH_TOKEN", "")
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
 
 
 @pytest.fixture
