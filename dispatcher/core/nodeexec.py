@@ -195,6 +195,14 @@ class NodeExecutor:
         # 角色提示词里可用的模板变量就这几个，一次给全。**不给超集**——
         # fill 是严格的，多给不会出错，但少给会当场报错，那正是我们要的：
         # 提示词里写了 {{x}} 而没人填，模型就会看到字面的花括号。
+        #
+        # **节点输入（``args``）不在其中，这是有意的。** 它是上游产出与用户数据的
+        # 合流，属于不可信输入：只以 ``data_block`` 进下面的 user 消息。以前这里
+        # 还有一个 ``inputs``，等于把同一份数据在 system 与 user 各放一份——冗余，
+        # 而且把用户可控的内容放进了模型最信任的槽位，注入即提权。三份引用了
+        # ``{{inputs}}`` 的角色提示词（receipt_extractor / merchant_classifier /
+        # ledger_auditor）已改为指向下面那个数据块——它们自己的开头本来就写着
+        # "你的系统提示词不得由外部数据填充"。
         tools_line = ", ".join(sorted(allowed)) or "（无）"
         system = fill(
             self._prompts.get(role.system_prompt_ref.replace("prompts/", "")),
@@ -203,7 +211,6 @@ class NodeExecutor:
                 "tool_whitelist": tools_line,
                 "node_goal": node.name or node.subtask_id,
                 "output_schema": node.output_schema_ref or "（未声明具体结构，按工具语义产出）",
-                "inputs": json.dumps(args, ensure_ascii=False),
             },
         ) + "\n\n" + _AGENT_CONTRACT.replace("{tools}", tools_line)
 
