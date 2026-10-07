@@ -17,6 +17,7 @@ capabilities:
   - bookkeeping.expense.record
   - bookkeeping.income.record
   - bookkeeping.ledger.query
+  - bookkeeping.categorize_merchants
   - bookkeeping.report.monthly
   - bookkeeping.investment.position
   - bookkeeping.investment.analysis
@@ -69,6 +70,30 @@ tools:
     side_effects: read
     requires_capabilities: []
     idempotent: true
+
+  # 批量归类：一次调用处理一整份名单。
+  # 与 normalize_merchant 的区别是**基数**，不是能力：那条一次看一个商户，
+  # 这条一次看一批。导入流水之后要归类的陌生商户常常几十个，逐条调用等于
+  # 几十次模型往返——慢、贵，而且每条的判断标准会在几次调用之间漂移。
+  - name: categorize_merchants
+    description: >
+      把一批陌生商户名一次性归入用户自己的分类体系，返回每条商户的建议分类。
+      传入的是一份名单，返回的是一份同样长度的建议表。
+    side_effects: read
+    requires_capabilities: [text]
+    idempotent: true
+    # 声明 input_schema 的理由与 build_ledger_entry 相同：参数抽取环节靠它
+    # 决定产出的形状。不声明的话抽取器只能猜，而这里猜错的后果是**一条商户都传不进来**，
+    # 工具却可能照样返回一个空表并报成功。
+    input_schema:
+      type: object
+      required: [merchants]
+      properties:
+        merchants:
+          type: array
+          items: { type: string }
+          description: 待归类的商户名列表，保持用户给的原始写法。
+        text_hint: { type: string, description: 用户附带的说明，可选 }
 
   # ---- 读操作：纯查表，不需要模型 ----
   - name: dedupe_check

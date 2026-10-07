@@ -115,6 +115,38 @@ SCHEDULE_DECISION = {
 # parse_natural_time 的产出（它自己会调一次模型）。
 PARSE_TIME = {"iso": "2026-10-07T15:00:00+08:00", "ambiguous": False, "note": ""}
 
+CATEGORIZE_PROFILE = {
+    "task_type": "bookkeeping.categorize_merchants",
+    "intent_summary": "把一批陌生商户归类",
+    "complexity": {"score": 0.3, "reasons": ["一批商户，一次归类"]},
+    "urgency": {"level": "normal"},
+    "required_capabilities": ["bookkeeping.categorize_merchants"],
+    "candidate_capabilities": ["bookkeeping.categorize_merchants"],
+    "data_sensitivity": "financial",
+    "recommended_mode": "sync",
+    "needs_clarification": False,
+    "confidence": 0.9,
+}
+
+CATEGORIZE_DECISION = {
+    "route_id": "single_tool_action",
+    "model_tier": "cheap",
+    "handler": "bookkeeping",
+    "tool_set": ["categorize_merchants"],
+    "execution_mode": "sync",
+    "decompose": False,
+    "budget": {"max_cost": 0.02, "max_wall_ms": 20000, "max_llm_calls": 4},
+    "rationale": "一次批量归类，单步即可完成。",
+    "confidence": 0.9,
+}
+
+CATEGORIZE_SLOT_FILL = {"merchants": ["星巴克", "滴滴出行", "盒马鲜生"]}
+
+CATEGORIZE_BATCH = {"suggestions": [
+    {"merchant": "星巴克", "category": "餐饮", "confidence": 0.95},
+    {"merchant": "滴滴出行", "category": "交通"},
+    {"merchant": "盒马鲜生", "category": "购物"},
+]}
 
 
 def make_dispatcher(llm, *, execution_enabled: bool = True, state=None):
@@ -316,7 +348,7 @@ async def test_deterministic_path_calls_no_model():
         async def aclose(self):
             return None
 
-    ctx = _ctx_with_exploding_llm(ExplodingLLM())
+    ctx = _ctx_for(ExplodingLLM())
     res = await h.tool_compute_portfolio(
         {"positions": [{"cost": 100, "value": 130}, {"cost": 50, "value": 40}]}, ctx
     )
@@ -325,7 +357,133 @@ async def test_deterministic_path_calls_no_model():
     assert res.output["return_pct"] == 13.33
 
 
-def _ctx_with_exploding_llm(llm):
+# ---------------------------------------------------------------------------
+# P1-c 批量归类（陌生商户导入流水后集中归类）
+# ---------------------------------------------------------------------------
+async def test_batch_categorization_is_one_call_for_the_whole_list():
+    """一份名单一次调用，产出 ``artifacts.main.suggestions``。
+
+    两件事一起验：
+
+    * **能走通**：``bookkeeping.categorize_merchants`` 作为任务类型与能力在
+      配置里成立，路由到 bookkeeping 并真的产出了归类结果；
+    * **基数是一次**：评估 + 路由 + 参数抽取之后只有 **一次** 归类调用。
+      逐条调用的话这里会看到 N 次（三个商户 → 六次），而那样每条的判断标准
+      还会在多次往返之间漂移——同一批商户被分进两个类。
+
+    词表项与 handler 能力**两处配置的耦合**由下面那条守卫用例单独钉住：
+    这里用的是模型给了 handler 的决策，那条走的是模型没给、守卫只能靠能力推的路。
+    """
+    llm = ScriptedLLM([
+        CATEGORIZE_PROFILE, CATEGORIZE_DECISION, CATEGORIZE_SLOT_FILL, CATEGORIZE_BATCH,
+    ])
+    d = make_dispatcher(llm)
+    try:
+        rec = await d.submit(
+            text_env("把这几个陌生商户归类：星巴克、滴滴出行、盒马鲜生", mode="sync")
+        )
+        assert rec.status == "succeeded", rec.error
+        assert rec.decision.route_id == "single_tool_action"
+        assert rec.decision.handler == "bookkeeping"
+        assert len(llm.calls) == 4, [c.tier for c in llm.calls]
+        # 形状按消费端的 wires 模型：artifacts.main.suggestions[{merchant, category}]
+        assert rec.artifacts["main"]["suggestions"] == [
+            {"merchant": "星巴克", "category": "餐饮"},
+            {"merchant": "滴滴出行", "category": "交通"},
+            {"merchant": "盒马鲜生", "category": "购物"},
+        ]
+    finally:
+        await d.aclose()
+
+
+def test_categorize_type_and_capability_do_not_fork(policy, registry):
+    """词表项与 handler 能力必须同时存在，否则守卫推不出承接的 handler。
+
+    模型没给 handler 时，画像能力是守卫唯一还能用的线索。只加 taxonomy 项、
+    不给 handler 声明同名能力，会走成：评估器把意图归到
+    ``bookkeeping.categorize_merchants``（它的类型只能从词表里选），而画像给出的
+    能力候选是一个**没有任何 handler 认领**的名字——守卫推不出唯一 handler，
+    把决策降级到兜底路由，再被拆解器判成"单步但点不出工具"，最终 422。
+
+    "模型不给 handler"不是假设：``guard.py`` 里那条从能力推导的路径就是因为它
+    实测经常不给才补的（模型认为那字段可推导，于是漏掉）。
+    """
+    from dispatcher.core.contract import TaskProfile
+    from dispatcher.core.guard import RawDecision, apply_guard
+
+    profile = TaskProfile.model_validate({
+        **CATEGORIZE_PROFILE,
+        "policy_version": policy.policy_version,
+        "modality": ["text"],
+    })
+    out = apply_guard(
+        policy,
+        # handler 与 tool_set 都留空——这条请求的成败全在"能力能不能定位到 handler"。
+        RawDecision(route_id="single_tool_action", model_tier="cheap",
+                    handler=None, tool_set=[]),
+        profile=profile, handler_ids=registry.ids,
+        handler_tools=registry.tool_map(), handler_caps=registry.capability_map(),
+    )
+    assert out.decision.handler == "bookkeeping"
+    assert "handler_fallback" not in out.decision.guard.applied, out.decision.guard.violations
+
+
+async def test_categorization_never_invents_a_category_outside_the_vocabulary():
+    """模型给出用户体系之外的分类名时**丢掉那一条**，不就近改写。
+
+    分类词表是用户的（``ctx.config.categories``）。替用户发明一个分类，会让
+    他在自己的分类选择器里对不上；消费端界面就是按"认不出来时说没给出建议，
+    绝不猜"来设计的。反例（体系内的"交通"）必须照常留下——只测"拒绝"不测
+    "放行"的测试抓不到"约束过宽把所有合法输入都拒了"。
+    """
+    from dispatcher.core.registry import HandlerManifest
+    from handlers.bookkeeping.handler import BookkeepingHandler
+
+    manifest = HandlerManifest.model_validate({
+        "handler_id": "bookkeeping", "version": "1",
+        "capabilities": ["bookkeeping.categorize_merchants"],
+        "tools": [{"name": "categorize_merchants", "requires_capabilities": ["text"]}],
+    })
+    h = BookkeepingHandler(manifest)
+    llm = ScriptedLLM([{"suggestions": [
+        {"merchant": "星巴克", "category": "餐饮美食"},   # 体系外 → 丢掉
+        {"merchant": "滴滴出行", "category": "交通"},     # 体系内 → 留下
+    ]}])
+    ctx = _ctx_for(llm, config={"categories": ["餐饮", "交通", "其他"]})
+
+    res = await h.tool_categorize_merchants({"merchants": ["星巴克", "滴滴出行"]}, ctx)
+    assert res.ok, res.failure
+    assert res.output["suggestions"] == [{"merchant": "滴滴出行", "category": "交通"}]
+
+
+async def test_categorization_reuses_local_knowledge_without_calling_the_model():
+    """已经归类过的商户不再问模型——与 ``normalize_merchant`` 共用一张本地表。
+
+    收益不只是省钱：同一批流水里重复出现的商户名，判断标准与逐条归类时一致。
+    """
+    from dispatcher.core.registry import HandlerManifest
+    from handlers.bookkeeping.handler import BookkeepingHandler
+
+    manifest = HandlerManifest.model_validate({
+        "handler_id": "bookkeeping", "version": "1",
+        "capabilities": ["bookkeeping.categorize_merchants"],
+        "tools": [{"name": "categorize_merchants", "requires_capabilities": ["text"]}],
+    })
+    h = BookkeepingHandler(manifest)
+    # 只预置一次响应：第二次真去问模型的话，ScriptedLLM 会当场抛
+    # "没有更多预置响应了"——测试因此因**该失败的那一条**而失败，而不是靠
+    # 一个可能被改宽的次数断言。
+    llm = ScriptedLLM([{"suggestions": [{"merchant": "星巴克", "category": "餐饮"}]}])
+    ctx = _ctx_for(llm, config={"categories": ["餐饮", "交通", "其他"]})
+
+    first = await h.tool_categorize_merchants({"merchants": ["星巴克"]}, ctx)
+    assert first.output["suggestions"] == [{"merchant": "星巴克", "category": "餐饮"}]
+    second = await h.tool_categorize_merchants({"merchants": ["星巴克"]}, ctx)
+    assert second.output["suggestions"] == [{"merchant": "星巴克", "category": "餐饮"}]
+    assert len(llm.calls) == 1, "只该有第一次那一次模型调用"
+
+
+def _ctx_for(llm, *, config=None):
     from dispatcher.core.budget import BudgetHandle
     from dispatcher.core.cancel import CancellationToken
     from dispatcher.core.context import DispatchContext, MediaResolver
@@ -340,7 +498,7 @@ def _ctx_with_exploding_llm(llm):
     return DispatchContext(
         task_id="t", subtask_id="s", tenant_id="d", user_id="u", trace_id="",
         route_id="r",
-        media=MediaResolver(st2), config={}, state=st,
+        media=MediaResolver(st2), config=config or {}, state=st,
         budget=BudgetHandle(_ledger=led, task_id="t", limit=1.0, spent=0.0, currency="CNY"),
         cancellation=CancellationToken(), events=EventBus(st),
         _policy=policy, _pricing=pricing, _llm=llm, _allowed_tiers=list(policy.model_tier_ids),

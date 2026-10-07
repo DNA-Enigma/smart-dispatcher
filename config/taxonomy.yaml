@@ -44,6 +44,13 @@ types:
     description: 查询账目、统计收支、"我这个月花了多少"。
     typical_modality: [text]
     sensitivity: financial
+  - id: bookkeeping.categorize_merchants
+    domain: bookkeeping
+    description: >
+      把一批陌生商户名归入用户自己的分类体系（导入流水后集中归类）。
+      一次请求给一整份名单、一次返回全部结果——不是每条商户建一个任务。
+    typical_modality: [text]
+    sensitivity: financial
   - id: bookkeeping.reconciliation
     domain: bookkeeping
     description: 对账、核对账单与实际流水、查找差异。

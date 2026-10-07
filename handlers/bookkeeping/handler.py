@@ -133,6 +133,84 @@ class BookkeepingHandler(HandlerBase):
     async def tool_lookup_merchant(self, args: dict, ctx: Any) -> ToolResult:
         return ToolResult(ok=True, output={"category": self._merchants.get(str(args.get("name") or ""))})
 
+    async def tool_categorize_merchants(self, args: dict, ctx: Any) -> ToolResult:
+        """把一批商户名归类——**一份名单一次调用**，不是一条商户一次。
+
+        与 ``normalize_merchant`` 的差别是基数而不是能力。导入流水之后要归类的
+        陌生商户常常几十个，逐条调用既慢又贵，而且每条的判断标准会在几十次
+        往返之间漂移——同一批商户可能被分到两个不同的类里。
+
+        两条纪律：
+
+        * **分类只能落在用户自己的体系里**（``ctx.config.categories``）。模型给出
+          体系外的分类名时**丢掉这条**而不是就近改写成别的分类——消费端就是按
+          "认不出来时返回空表，绝不猜"来设计界面的。
+        * **已经见过的商户不再问模型**。这条路与 ``normalize_merchant`` 共用一张
+          本地表，于是同一批流水里重复出现的商户名，判断标准与逐条归类时一致。
+        """
+        raw = args.get("merchants")
+        if isinstance(raw, str):
+            # 参数抽取偶尔会把一个名单压成一个字符串（逗号或顿号分隔）。
+            # 直接判 bad_input 会把一个能救的输入丢掉，这里按分隔符再切一次。
+            raw = [x for x in raw.replace("、", ",").replace("，", ",").split(",") if x.strip()]
+        if not isinstance(raw, list) or not raw:
+            return ToolResult.fail(
+                "bad_input",
+                f"merchants 必须是非空数组，收到 {raw!r}",
+                retryable=False,
+            )
+        names = [str(m).strip() for m in raw if str(m).strip()]
+        if not names:
+            return ToolResult.fail("bad_input", "merchants 里没有有效的商户名", retryable=False)
+
+        categories = self._categories(ctx)
+        # 判断不了时的落点必须**由配置决定**，不能在代码里写死一个分类名——
+        # 词表是用户的（ctx.config.categories）。"其他"是随附兜底词表里的那个，
+        # 用户自己的词表里没有它就退回最后一个，而不是硬塞一个它不认识的分类。
+        fallback = "其他" if "其他" in categories else categories[-1]
+        unknown = [n for n in dict.fromkeys(names) if n not in self._merchants]
+        if unknown:
+            listing = "\n".join(f"- {n}" for n in unknown)
+            res = await ctx.llm(
+                [
+                    LLMMessage.user(
+                        f"把下列商户名各自归入这些分类之一：{categories}。"
+                        '只输出 JSON：{"suggestions": '
+                        '[{"merchant": string, "category": string, "confidence": number}]}。'
+                        "\n每个商户名都要出现一次，merchant 原样返回，不要改写、不要合并。"
+                        f'\n实在判断不了的填 "{fallback}"，不要留空。'
+                        f"\n商户名：\n{listing}"
+                    )
+                ],
+                requires=("text",),
+                json_mode=True,
+                note="categorize_merchants",
+            )
+            try:
+                data = json.loads(
+                    res.text.strip().removeprefix("```json").removesuffix("```").strip()
+                )
+            except Exception:
+                return ToolResult.fail(
+                    "schema_validation_failed",
+                    "商户归类输出不是合法 JSON",
+                    retryable=False,
+                )
+            for item in data.get("suggestions") or []:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("merchant") or "").strip()
+                cat = str(item.get("category") or "").strip()
+                if name and cat in categories:
+                    self._merchants[name] = cat
+
+        suggestions = [
+            {"merchant": n, "category": self._merchants[n]}
+            for n in dict.fromkeys(names)
+            if n in self._merchants
+        ]
+        return ToolResult(ok=True, output={"suggestions": suggestions})
+
     async def tool_list_categories(self, args: dict, ctx: Any) -> ToolResult:
         return ToolResult(ok=True, output={"categories": self._categories(ctx)})
 
