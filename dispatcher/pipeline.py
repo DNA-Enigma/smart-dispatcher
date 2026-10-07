@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -63,6 +64,8 @@ from .stages.evaluator import Evaluator
 from .stages.router import Router
 
 DEFAULT_TEMPLATE_DIR = "config/flow_templates"
+
+log = logging.getLogger("dispatcher")
 
 
 @dataclass
@@ -153,9 +156,15 @@ class Dispatcher:
                 policy=policy,
                 evolution_cfg=policy.evolution.model_dump(mode="json"),
             )
-        # 每次运行需要独立的取消令牌与执行器（令牌是任务级的）
+        # 每次运行需要独立的取消令牌与执行器（令牌是任务级的）。
+        # **两个 dict 都必须有出账**：它们只进不出时，长跑进程会按任务数线性增长
+        # （审计里的"内存泄漏"）。清账点见 ``_forget``。
         self._running: dict[str, asyncio.Task] = {}
         self._cancels: dict[str, CancellationToken] = {}
+        # 任务引用的媒体。与上面两个不同：它要活到任务**到达终态**为止——
+        # 停在 awaiting_clarification 的任务恢复时还要读那张截图，因此清理过期
+        # 媒体时必须把它排除在外（见 protected_media_ids / sweep_media）。
+        self._media_refs: dict[str, tuple[str, ...]] = {}
 
     # ------------------------------------------------------------------
     @classmethod
@@ -202,6 +211,7 @@ class Dispatcher:
             media=InMemoryMediaStore(
                 allowed_mime=policy.limits.media.allowed_mime,
                 max_bytes=policy.limits.media.max_bytes,
+                default_retain_days=cfg.settings.dispatcher_media_retain_days,
             ),
             state=state,
             taxonomy=taxonomy,
@@ -227,6 +237,80 @@ class Dispatcher:
         if close is not None:
             await close()
         await self.llm.aclose()
+
+    # ------------------------------------------------------------------
+    # 在册任务的清账
+    # ------------------------------------------------------------------
+    def _forget(self, task_id: str) -> None:
+        """任务不再需要被追踪/取消时，把 ``_running`` / ``_cancels`` 里的条目去掉。
+
+        **只清这两个**：媒体引用另算。它要活到终态——停在
+        ``awaiting_clarification`` 的任务恢复时还要读那张截图，由
+        ``_release_media`` 单独回收。
+        """
+        self._running.pop(task_id, None)
+        self._cancels.pop(task_id, None)
+
+    def _release_media(self, task_id: str) -> None:
+        """任务到达终态：没有任何东西还会读它引用的媒体了。"""
+        self._media_refs.pop(task_id, None)
+
+    def _on_task_done(self, task_id: str, task: asyncio.Task) -> None:
+        """后台任务的收尾钩子。**四种退出方式都会走到这里**：正常完成、失败、
+        被 ``cancel()`` 取消、以及 ``_advance`` 抛出的致命错误。少了它，
+        ``_running`` 里那条记录就永远留着（连它引用的 TaskRecord 一起）。
+
+        异常在这里取一次：后台任务没有人 ``await``，不取的话事件循环关闭时会打一条
+        "Task exception was never retrieved"。任务本身已经在 ``_advance`` 里落了终态
+        与 ``task.failed`` 事件，日志里再喊一次只会掩盖真正的问题。
+        """
+        self._forget(task_id)
+        if task.cancelled():
+            # 取消是调用方要的，不是异常；但任务不会再推进了，媒体引用一并放掉。
+            self._release_media(task_id)
+            return
+        exc = task.exception()
+        if exc is not None:
+            log.warning("后台任务 %s 异常退出：%r", task_id, exc)
+            self._release_media(task_id)
+
+    def protected_media_ids(self) -> set[str]:
+        """仍被非终态任务引用的媒体 id。
+
+        ``_media_refs`` 里只留非终态任务的条目（终态时由 ``_advance`` 的 finally
+        放掉），因此这里直接取并集。停在 ``awaiting_clarification`` 的任务也在内：
+        它恢复时要读那张截图，提前删掉会让恢复必然失败（``unsupported_media``
+        是 fatal，见 core/errors.py）。
+        """
+        return {mid for refs in self._media_refs.values() for mid in refs}
+
+    async def sweep_media(self, *, now: datetime | None = None) -> int:
+        """清一次过期媒体，返回删除条数。"""
+        return await self.media.sweep_expired(
+            now or datetime.now(UTC), protected=self.protected_media_ids()
+        )
+
+    async def media_sweeper(self, interval_s: float) -> None:
+        """周期性清理过期媒体，直到被取消。
+
+        ``docs/05-media.md`` 一直写着"清理由 ``sweep_expired(now)`` 周期性执行，
+        由定时任务驱动"——而全仓找不到那个定时任务，这是"媒体常驻不过期"的另一半。
+        单次失败只记警告：清理是后台维护，不该把进程带走。
+
+        下界 0.05s 只防"配置写成 0 变成忙循环"；默认值是 300s。
+        """
+        interval = max(0.05, float(interval_s))
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                removed = await self.sweep_media()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # 后台维护不该因为一次失败就停摆
+                log.warning("媒体清理失败：%r", e)
+                continue
+            if removed:
+                log.info("已清理过期媒体 %d 条", removed)
 
     # ------------------------------------------------------------------
     @staticmethod
@@ -413,11 +497,22 @@ class Dispatcher:
 
         cancel = CancellationToken()
         self._cancels[record.task_id] = cancel
+        refs = tuple(r.media_id for r in (envelope.input.media or []))
+        if refs:
+            self._media_refs[record.task_id] = refs
 
         # 先把评估、路由、拆解内联做完——它们都很快，而且结果决定这一侧怎么等
-        await self._advance(record, envelope, cancel, stop_after_planning=True)
+        try:
+            await self._advance(record, envelope, cancel, stop_after_planning=True)
+        except Exception:
+            # 规划阶段抛出（致命错误走这条）也要清账，否则这条路径同样只进不出。
+            self._forget(record.task_id)
+            raise
 
         if record.status in TERMINAL_STATUSES or record.status == "awaiting_clarification":
+            # 这时候没有 asyncio 任务在跑了：终态不必再取消；等人则靠状态机取消
+            # （``clarify`` 会用 setdefault 补一个新令牌，不依赖旧令牌活着）。
+            self._forget(record.task_id)
             return record
 
         if background is None:
@@ -426,13 +521,19 @@ class Dispatcher:
         if background:
             record.mode = "async"
             await self._save(record)
-            self._running[record.task_id] = asyncio.create_task(
-                self._advance(record, envelope, cancel)
-            )
+            task = asyncio.create_task(self._advance(record, envelope, cancel))
+            self._running[record.task_id] = task
+            # 出账挂在这里而不是写在 _advance 里：_advance 也被同步/澄清两条路径
+            # 复用，而"这个 asyncio 任务什么时候结束"只有这里知道。
+            task.add_done_callback(lambda t, tid=record.task_id: self._on_task_done(tid, t))
             return record
 
         record.mode = "sync"
-        await self._advance(record, envelope, cancel)
+        try:
+            await self._advance(record, envelope, cancel)
+        finally:
+            # 内联跑完了，这一侧没有后台任务再需要取消令牌。
+            self._forget(record.task_id)
         return record
 
     def _should_background(self, record: TaskRecord) -> bool:
@@ -712,6 +813,12 @@ class Dispatcher:
             if e.fatal:
                 raise
             return record
+        finally:
+            # 到达终态之后，没有任何东西还会读这张截图了，媒体引用可以放掉。
+            # 停在 awaiting_clarification / stop_after_planning 的**不放**——
+            # 它们还会被下一趟 _advance 接着跑。
+            if record.status in TERMINAL_STATUSES:
+                self._release_media(task_id)
 
     # ------------------------------------------------------------------
     async def _answer_directly(
@@ -808,6 +915,7 @@ class Dispatcher:
             record.status = "cancelled"
             record.ended_at = datetime.now(UTC)
             record.artifacts = record.node_outputs or None
+            self._release_media(task_id)
             await self._save(record)
             await self.events.emit(
                 task_id, "task.cancelled", {"by": "clarification:cancel"}
@@ -835,9 +943,14 @@ class Dispatcher:
             prior = {**prior, **reply.edits}
             record.node_outputs = prior
             record.artifacts = prior
-        return await self._advance(
-            record, envelope, cancel, prior=prior, clarification=reply
-        )
+        try:
+            return await self._advance(
+                record, envelope, cancel, prior=prior, clarification=reply
+            )
+        finally:
+            # 恢复是内联跑完的（没有后台任务），跑完就出账；媒体引用的去留由
+            # ``_advance`` 的 finally 按终态判定。
+            self._forget(task_id)
 
     async def cancel(
         self, task_id: str, *, reason: str = "client_requested", tenant_id: str | None = None
@@ -853,6 +966,10 @@ class Dispatcher:
             task.cancel()
         record.status = "cancelled"
         record.ended_at = datetime.now(UTC)
+        # 取消是终态：在册条目与媒体引用当场放掉。后台任务的 done 回调随后还会
+        # 走一遍 ``_forget``，两个 pop 都是幂等的。
+        self._forget(task_id)
+        self._release_media(task_id)
         await self._save(record)
         await self.events.emit(task_id, "task.cancelled", {"by": reason})
         return record

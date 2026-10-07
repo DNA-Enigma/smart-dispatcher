@@ -1,11 +1,13 @@
-"""``clarify`` / ``feedback`` 的请求体校验。
+"""请求体校验：**所有**接 JSON 的端点。
 
-这两个端点此前是裸 ``await request.json()``：字段名写错既 200 又不生效。本文件钉住
-校验层的四条边界——正常放行、缺必填 400、类型错 400、未知字段**警告但不拒绝**——
-并确认失败响应体就是 ``schemas/problem.json`` 的合法实例（不是随手拼的 dict）。
+``clarify`` / ``feedback`` 此前是裸 ``await request.json()``：字段名写错既 200 又不生效。
+本文件钉住校验层的四条边界——正常放行、缺必填 400、类型错 400、未知字段**警告但不拒绝**
+——并确认失败响应体就是 ``schemas/problem.json`` 的合法实例（不是随手拼的 dict）。
 
-用 HTTP 层测而不是直接调 ``read_body``：要证的正是"端点接上了校验"，
-只测函数会漏掉"端点忘了调"这一类错误。
+用 HTTP 层测而不是直接调 ``read_body``：要证的正是"端点接上了校验"，只测函数会漏掉
+"端点忘了调"这一类错误——**而它真的发生了**：``create_task`` / ``approve`` / ``reject`` /
+``rollback`` 四个端点当时就是裸 ``request.json()``，非法 JSON 一路冒成 500 纯文本
+（不是 Problem）。后半部分把这四个端点也钉住，包括 ``approve`` 空体仍然合法。
 """
 
 from __future__ import annotations
@@ -24,6 +26,10 @@ PROBLEM_SCHEMA_ID = "https://smart-dispatcher.dev/schemas/problem.json"
 
 CLARIFY = "/v1/tasks/t1/clarify"
 FEEDBACK = "/v1/tasks/t1/feedback"
+TASKS = "/v1/tasks"
+APPROVE = "/v1/evolution/suggestions/s_1/approve"
+REJECT = "/v1/evolution/suggestions/s_1/reject"
+ROLLBACK = "/v1/policy/rollback"
 
 
 class _Snapshot:
@@ -67,6 +73,58 @@ def fake(monkeypatch: pytest.MonkeyPatch) -> _FakeDispatcher:
 
 @pytest.fixture
 async def client(fake: _FakeDispatcher):
+    transport = httpx.ASGITransport(app=create_app())
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        yield c
+
+
+class _StubEvolution:
+    """只够回答"端点有没有把非法 JSON 挡在流水线之外"。
+
+    approve / reject / rollback 的**语义**由 ``test_evolution.py`` 管；
+    这里管的是请求边界，因此记录调用即可，不实现任何版本流转。
+    """
+
+    def __init__(self) -> None:
+        self.approved: list[dict] = []
+        self.rolled_back: list[dict] = []
+
+    async def approve(self, suggestion_id, *, approved_by, scope=None, note=None):
+        self.approved.append({"id": suggestion_id, "by": approved_by, "scope": scope})
+        return {
+            "policy_version": "p_2", "parent_version": "p_1", "changed": ["limits.x"],
+            "scope": {"canary": {"percent": 10}}, "status": "active",
+            "policy": {"policy_version": "p_2"},
+        }
+
+    async def reject(self, suggestion_id, *, reason, decided_by):
+        return {"status": "rejected"}
+
+    async def rollback(self, *, to_version, note=None):
+        self.rolled_back.append({"to": to_version, "note": note})
+        return {"policy_version": to_version, "policy": {"policy_version": to_version}}
+
+
+class _EvolutionDispatcher:
+    """``_require_evolution()`` 要求 ``evolution`` 非 None，``apply_policy`` 也得在。"""
+
+    def __init__(self) -> None:
+        self.evolution = _StubEvolution()
+        self.applied: list = []
+
+    def apply_policy(self, policy) -> None:
+        self.applied.append(policy)
+
+
+@pytest.fixture
+def evo(monkeypatch: pytest.MonkeyPatch) -> _EvolutionDispatcher:
+    f = _EvolutionDispatcher()
+    monkeypatch.setattr(app_module, "_dispatcher", f)
+    return f
+
+
+@pytest.fixture
+async def evo_client(evo: _EvolutionDispatcher):
     transport = httpx.ASGITransport(app=create_app())
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
         yield c
@@ -180,3 +238,70 @@ async def test_feedback_on_unknown_task_is_404_not_400(client, schemas):
     body = resp.json()
     jsonschema_validate(body, schemas[PROBLEM_SCHEMA_ID])
     assert body["code"] == "not_found"
+
+
+# ------------------------------------------- 另外四个端点：非法 JSON 也是 400
+#
+# 这四个此前是裸 ``await request.json()``。Starlette 的 ``Request.json()`` 抛的是
+# ``JSONDecodeError``——不是 ``DispatcherError``，因此绕过 ``app.py`` 的异常处理器，
+# 冒到 ServerErrorMiddleware 变成 **500 纯文本**。客户端拿到的东西既不是契约里的
+# Problem，也分不清是自己发错了还是服务端挂了。
+async def test_create_task_malformed_json_is_400_not_500(client, schemas):
+    resp = await client.post(
+        TASKS, content=b"{not json", headers={"content-type": "application/json"}
+    )
+    _assert_problem(schemas, resp, status=400)
+
+
+async def test_create_task_empty_body_is_400_not_500(client, schemas):
+    resp = await client.post(TASKS, content=b"", headers={"content-type": "application/json"})
+    _assert_problem(schemas, resp, status=400)
+
+
+async def test_create_task_non_object_body_is_400_not_500(client, schemas):
+    resp = await client.post(TASKS, json=["不是对象"])
+    _assert_problem(schemas, resp, status=400)
+
+
+async def test_approve_malformed_json_is_400_not_500(evo_client, schemas):
+    resp = await evo_client.post(
+        APPROVE, content=b"{bad", headers={"content-type": "application/json"}
+    )
+    _assert_problem(schemas, resp, status=400)
+
+
+async def test_approve_empty_body_is_still_allowed(evo_client, evo):
+    """空体是**合法**的（``scope``/``note`` 都可选）——统一读体路径不能顺手把它拒掉。"""
+    resp = await evo_client.post(APPROVE)
+    assert resp.status_code == 200, resp.text
+    assert evo.evolution.approved[0]["id"] == "s_1"
+    assert evo.applied, "批准之后要热换策略"
+
+
+async def test_reject_malformed_json_is_400_not_500(evo_client, schemas):
+    resp = await evo_client.post(
+        REJECT, content=b"<xml/>", headers={"content-type": "application/json"}
+    )
+    _assert_problem(schemas, resp, status=400)
+
+
+async def test_reject_without_reason_is_400(evo_client, schemas):
+    """理由本身是信号，缺了就拒——这条是老行为，钉住它没被读体路径改掉。"""
+    resp = await evo_client.post(REJECT, json={"note": "忘了写理由"})
+    body = _assert_problem(schemas, resp, status=400)
+    assert "理由" in body["detail"]
+
+
+async def test_rollback_malformed_json_is_400_not_500(evo_client, schemas):
+    resp = await evo_client.post(
+        ROLLBACK, content=b"{}", headers={"content-type": "application/json"}
+    )
+    # 空对象是**合法 JSON**，缺 to_version 是另一条 400；先钉住它不是 500
+    _assert_problem(schemas, resp, status=400)
+
+
+async def test_rollback_not_json_at_all_is_400_not_500(evo_client, schemas):
+    resp = await evo_client.post(
+        ROLLBACK, content=b"not-json", headers={"content-type": "application/json"}
+    )
+    _assert_problem(schemas, resp, status=400)

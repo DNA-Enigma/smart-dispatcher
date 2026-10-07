@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import uuid
+from collections.abc import Collection
 from datetime import UTC, datetime, timedelta
 
 from ..core.errors import DispatcherError
@@ -32,9 +33,14 @@ def _kind_of(mime: str) -> MediaKind:
 
 
 class InMemoryMediaStore:
-    def __init__(self, *, allowed_mime: list[str], max_bytes: int) -> None:
+    def __init__(
+        self, *, allowed_mime: list[str], max_bytes: int, default_retain_days: int = 1
+    ) -> None:
         self._allowed = frozenset(allowed_mime)
         self._max_bytes = max_bytes
+        # 缺省保留期，来自 Settings。下界 1 是刻意的：``expires_at=None``
+        # （永不过期）是"金融截图常驻内存"那条路，不能靠配置把它打开。
+        self._default_retain_days = max(1, default_retain_days)
         self._blobs: dict[str, bytes] = {}
         self._records: dict[str, MediaRecord] = {}
 
@@ -57,7 +63,23 @@ class InMemoryMediaStore:
                 context={"bytes": len(data), "max_bytes": self._max_bytes},
             )
         now = datetime.now(UTC)
-        expires = now + timedelta(days=retain_days) if retain_days else None
+        # 缺省与 0 都落到配置的缺省保留期：**每个记录都必须有 expires_at**
+        # （``None`` = 永不过期，那正是本轮要消掉的那条路）。``retain_days=0``
+        # 在 docs/05-media.md 里写着"任务结束即删"，而"任务什么时候结束"是调度层
+        # 才知道的事，store 无从判断；接口层因此把它夹到 [1, 上界] 再进来，
+        # 这里再兜一次底，免得绕过接口层的调用方拿到一个永不过期的记录。
+        days = retain_days if retain_days and retain_days > 0 else self._default_retain_days
+        try:
+            expires = now + timedelta(days=days)
+        except OverflowError as e:
+            # 上限的权威在接口层（那里把 retain_days 夹进区间）。这里只把"绕过夹取
+            # 直接调 store"的那条路从 500 变成一个**有类型的错误**，不再造第二个界
+            # ——两处各写一份上限，就一定会分叉。
+            raise DispatcherError(
+                "invalid_request",
+                f"retain_days={days} 超出可表示的保留期",
+                context={"retain_days": days},
+            ) from e
         mid = f"m_{uuid.uuid4().hex[:16]}"
         rec = MediaRecord(
             media_id=mid,
@@ -91,10 +113,11 @@ class InMemoryMediaStore:
         self._blobs.pop(media_id, None)
         return self._records.pop(media_id, None) is not None
 
-    async def sweep_expired(self, now: datetime) -> int:
+    async def sweep_expired(self, now: datetime, *, protected: Collection[str] = ()) -> int:
+        keep = set(protected)
         expired = [
             mid for mid, r in self._records.items()
-            if r.expires_at is not None and r.expires_at <= now
+            if mid not in keep and r.expires_at is not None and r.expires_at <= now
         ]
         for mid in expired:
             await self.delete(mid)

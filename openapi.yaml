@@ -208,7 +208,8 @@ paths:
         用于穿透 NAT 保持连接。
 
         鉴权在建立连接前完成：凭据不对是 `401`（Problem 体的 JSON，不是事件流），
-        任务不属于调用方是 `404`。
+        任务不属于调用方是 `404`；同时订阅的事件流数量达到上限是 `429`，
+        带 `Retry-After`（秒）说明何时可以重连。
       parameters:
         - $ref: "#/components/parameters/TaskId"
         - name: since
@@ -226,6 +227,17 @@ paths:
             Cache-Control:
               schema: { type: string, const: no-cache }
         "404": { $ref: "#/components/responses/NotFound" }
+        "429":
+          description: >
+            同时订阅的任务事件流已达上限（`limits` 中的 SSE 并发上限）。
+            请在 `Retry-After` 给出的秒数之后重连。
+          headers:
+            Retry-After:
+              description: 建议多少秒后重连（秒，下限 1）。
+              schema: { type: integer, minimum: 1 }
+          content:
+            application/problem+json:
+              schema: { $ref: "schemas/problem.json" }
 
   /tasks/{task_id}/result:
     get:

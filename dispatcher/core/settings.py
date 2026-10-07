@@ -59,6 +59,25 @@ class Settings(BaseSettings):
     dispatcher_tenant: str = "default"
     dispatcher_user: str = "owner"
 
+    # ---- 请求体与连接的自保上限。----
+    # 与 llm_qps/llm_max_concurrency 同类：属于"这个进程怎么保护自己"，
+    # 不是可调的产品策略，因此在这里而不是在策略文件里。
+    #
+    # 通用请求体上限（字节）。所有 JSON 端点按它判，**边读边判**（见
+    # interface/validation.py 的 read_raw_body）；媒体上传取它与
+    # routing.policy.yaml 的 limits.media.max_bytes 的较大者。
+    dispatcher_max_request_bytes: int = 10 * 1024 * 1024
+    # SSE 并发连接上限。每个订阅占一个连接、一个生成器协程与一个轮询任务。
+    # **0 或负数表示不限制**（部署方显式关掉这个闸）。
+    dispatcher_sse_max_connections: int = 100
+    # 媒体保留：缺省保留期（天）与上界（天）。缺省值必须有界——
+    # ``expires_at=None``（永不过期）正是"金融截图常驻内存"那条路。
+    dispatcher_media_retain_days: int = 1
+    dispatcher_media_retain_max_days: int = 30
+    # 过期媒体的清理周期（秒）。docs/05-media.md 承诺过"由定时任务驱动"，
+    # 此前那个定时任务不存在。
+    dispatcher_media_sweep_interval_s: float = 300.0
+
     # 调用的硬边界。与 routing.policy.yaml 的 limits 是两回事：
     # 那些是策略（可被建议修改），这些是进程级的自保（不可被任何东西改）。
     llm_request_timeout_s: float = 60.0

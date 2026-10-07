@@ -31,12 +31,59 @@ from ..core.settings import get_settings
 from ..core.state import TERMINAL_STATUSES
 from ..pipeline import Dispatcher, describe_config
 from .auth import AuthConfig, BearerAuthMiddleware, request_identity
+from .limiter import ConnectionLimiter
 from .problems import problem_response
-from .validation import read_body
+from .validation import read_body, read_json_document, read_raw_body
 
 log = logging.getLogger("dispatcher")
 
 _dispatcher: Dispatcher | None = None
+
+#: 分页 ``limit`` 的上下界。与 ``openapi.yaml`` 对 ``limit`` 的声明
+#: （``minimum: 1, maximum: 100``）同一组值——契约里写着界，代码里就得真夹。
+_LIMIT_MIN = 1
+_LIMIT_MAX = 100
+
+#: SSE 超限时建议客户端等多久（毫秒）。进 ``Retry-After`` 头。
+_SSE_RETRY_AFTER_MS = 5000
+
+
+def _clamp_limit(limit: int) -> int:
+    """把分页 ``limit`` 夹进契约声明的区间。
+
+    不夹的后果是实测过的：SQLite 的 ``LIMIT -1`` 是"不限"，``GET /v1/tasks?limit=-1``
+    于是拉全表（``sqlite_state.py`` / ``sqlite_evolution.py`` 三处查询）。
+
+    **为什么是静默夹取而不是 400/422**：走 FastAPI 的 ``Query(ge=1, le=100)`` 会返回
+    422 + ``{"detail": ...}``——那不是契约里的 Problem 体，为了夹一个分页参数而制造
+    一次契约违规不划算。越界夹到边界仍然是一个能用的分页请求，口径与 ``retain_days``
+    一致。下界取 1 而不是 0：``LIMIT 0`` 是"什么都不返回"，而调用方要的是第一页。
+    """
+    return max(_LIMIT_MIN, min(limit, _LIMIT_MAX))
+
+
+def _retain_days(raw: str | None) -> int:
+    """``retain_days`` 查询参数 → 保留天数。
+
+    缺省/非法 → 配置的缺省保留期；数字 → 夹进 ``[1, dispatcher_media_retain_max_days]``。
+
+    下界 1 是刻意的：``expires_at=None``（永不过期）正是本轮要消掉的那条路，而 ``0``
+    （``docs/05-media.md`` 里的"任务结束即删"）不是 store 能实现的语义——它不知道任务
+    什么时候结束。夹取同时消掉了 ``timedelta(days=巨大值)`` 的 OverflowError
+    （此前 ``?retain_days=<21 位数字>`` 是稳定 500）。
+    """
+    settings = get_settings()
+    ceiling = max(1, settings.dispatcher_media_retain_max_days)
+    default = min(max(1, settings.dispatcher_media_retain_days), ceiling)
+    if raw is None:
+        return default
+    try:
+        # 超长数字串会在这里抛 ValueError（int() 有位数上限），与"不是数字"同罪。
+        days = int(raw)
+    except ValueError:
+        log.warning("retain_days=%r 不是整数，按缺省保留期 %d 天处理", raw, default)
+        return default
+    return max(1, min(days, ceiling))
 
 
 def get_dispatcher() -> Dispatcher:
@@ -50,9 +97,16 @@ async def lifespan(app: FastAPI):
     global _dispatcher
     _dispatcher = Dispatcher.build()
     log.info("smart-dispatcher 启动：%s", describe_config(_dispatcher))
+    # 过期媒体的周期清理：docs/05-media.md 承诺"由定时任务驱动"，而此前
+    # sweep_expired 全仓没有调用点——缺的正是这个任务。
+    sweeper = asyncio.create_task(
+        _dispatcher.media_sweeper(get_settings().dispatcher_media_sweep_interval_s)
+    )
     try:
         yield
     finally:
+        sweeper.cancel()
+        await asyncio.gather(sweeper, return_exceptions=True)
         await _dispatcher.aclose()
         _dispatcher = None
 
@@ -84,6 +138,11 @@ def create_app(*, auth: AuthConfig | None = None) -> FastAPI:
     )
     # 鉴权挂在这里，而不是逐个端点加依赖：新端点自动被保护。
     app.add_middleware(BearerAuthMiddleware, config=auth)
+
+    # SSE 连接闸按 app 实例建（不是进程级单例）：测试里会构造多个 app，
+    # 单例会让用例之间互相影响。挂在 state 上是为了测试能直接把它占满。
+    sse_limiter = ConnectionLimiter(limit=get_settings().dispatcher_sse_max_connections)
+    app.state.sse_limiter = sse_limiter
 
     # ------------------------------------------------------------------
     @app.exception_handler(DispatcherError)
@@ -196,12 +255,20 @@ def create_app(*, auth: AuthConfig | None = None) -> FastAPI:
         """
         d = get_dispatcher()
         identity = request_identity(request)
-        body = await request.body()
+        # 这条路由的上限取"通用上限"与"存储层真正执行的上限"的**较大者**：
+        # 后者在 routing.policy.yaml 的 limits.media.max_bytes 里，另设一个环境变量
+        # 只会与它分叉（"两处各写一份上限一定会分叉"是本仓已有的教训）。
+        # 收的是原始二进制而不是 base64，因此不需要 4/3 的编码余量。
+        body = await read_raw_body(
+            request,
+            endpoint="POST /v1/media",
+            max_bytes=max(get_settings().dispatcher_max_request_bytes,
+                          d.policy.limits.media.max_bytes),
+        )
         if not body:
             raise DispatcherError("invalid_request", "请求体为空")
         mime = (request.headers.get("content-type") or "").split(";")[0].strip()
-        retain_raw = request.query_params.get("retain_days")
-        retain_days = int(retain_raw) if retain_raw and retain_raw.isdigit() else None
+        retain_days = _retain_days(request.query_params.get("retain_days"))
         rec = await d.media.put(
             body, mime,
             user_id=identity.user_id,
@@ -238,7 +305,9 @@ def create_app(*, auth: AuthConfig | None = None) -> FastAPI:
     @app.post("/v1/tasks")
     async def create_task(request: Request) -> JSONResponse:
         d = get_dispatcher()
-        payload = await request.json()
+        # 走统一的读体路径：非法 JSON / 非对象 / 空体是 **400 Problem**，
+        # 而不是 ``Request.json()`` 抛出去的 500 纯文本。
+        payload = await read_json_document(request, endpoint="POST /v1/tasks")
         try:
             envelope = TaskEnvelope.model_validate(payload)
         except Exception as e:
@@ -319,7 +388,8 @@ def create_app(*, auth: AuthConfig | None = None) -> FastAPI:
         别人的任务。``user_id`` 保留（契约里声明了它）但只能在自家租户内选人。
         """
         records = await get_dispatcher().list(
-            tenant_id=request_identity(request).tenant_id, user_id=user_id, limit=limit
+            tenant_id=request_identity(request).tenant_id, user_id=user_id,
+            limit=_clamp_limit(limit),
         )
         return {"items": [r.to_snapshot() for r in records], "next_cursor": None}
 
@@ -396,7 +466,7 @@ def create_app(*, auth: AuthConfig | None = None) -> FastAPI:
     @app.get("/v1/evolution/suggestions")
     async def list_suggestions(status: str | None = None, limit: int = 50) -> dict[str, Any]:
         _, loop = _require_evolution()
-        items = await loop.list_suggestions(status=status, limit=limit)
+        items = await loop.list_suggestions(status=status, limit=_clamp_limit(limit))
         proposals = [s for s in items if s.get("status") == "proposed"]
         return {
             "items": items,
@@ -425,7 +495,13 @@ def create_app(*, auth: AuthConfig | None = None) -> FastAPI:
         """
         d, loop = _require_evolution()
         identity = request_identity(request)
-        body = await request.json() if await request.body() else {}
+        # ``allow_empty``：这个端点历史上允许不带请求体（scope/note 都是可选的），
+        # 空体继续按 {} 处理，只是非法 JSON 不再是 500 而是 400 Problem。
+        body = await read_json_document(
+            request,
+            endpoint="POST /v1/evolution/suggestions/{suggestion_id}/approve",
+            allow_empty=True,
+        )
         version = await loop.approve(
             suggestion_id,
             approved_by=identity.user_id,
@@ -447,7 +523,9 @@ def create_app(*, auth: AuthConfig | None = None) -> FastAPI:
     async def reject_suggestion(suggestion_id: str, request: Request) -> dict[str, Any]:
         _, loop = _require_evolution()
         identity = request_identity(request)
-        body = await request.json()
+        body = await read_json_document(
+            request, endpoint="POST /v1/evolution/suggestions/{suggestion_id}/reject"
+        )
         if not body.get("reason"):
             raise DispatcherError("invalid_request", "拒绝必须给出理由——理由本身是信号")
         updated = await loop.reject(
@@ -459,7 +537,7 @@ def create_app(*, auth: AuthConfig | None = None) -> FastAPI:
     @app.get("/v1/policy/versions")
     async def list_policy_versions(limit: int = 50) -> dict[str, Any]:
         _, loop = _require_evolution()
-        rows = await loop.list_versions(limit=limit)
+        rows = await loop.list_versions(limit=_clamp_limit(limit))
         return {
             "items": [
                 {"policy_version": v["policy_version"], "parent_version": v.get("parent_version"),
@@ -472,7 +550,7 @@ def create_app(*, auth: AuthConfig | None = None) -> FastAPI:
     @app.post("/v1/policy/rollback")
     async def rollback_policy(request: Request) -> dict[str, Any]:
         d, loop = _require_evolution()
-        body = await request.json()
+        body = await read_json_document(request, endpoint="POST /v1/policy/rollback")
         to_version = str(body.get("to_version") or "")
         if not to_version:
             raise DispatcherError("invalid_request", "缺少 to_version")
@@ -497,6 +575,24 @@ def create_app(*, auth: AuthConfig | None = None) -> FastAPI:
         # 超上限时只重放最近的这些，并把是否截断如实告知（`replay_truncated`），
         # 让客户端知道"你漏掉的中间部分要靠快照补，不要指望事件流"。
         replay_limit = d.policy.limits.memory_events
+
+        # **上限**：每个订阅占一个连接、一个生成器协程与一个轮询 watcher。
+        # 放在 d.get() 之后：404 的请求不该消耗名额。
+        lease = sse_limiter.acquire()
+        if lease is None:
+            # 429 而不是 503：码表里没有 503 的码（新增码属于契约变更），而
+            # ``rate_limited`` 的语义正是"用量到顶、稍后重试"，它还会让
+            # ``problem_response`` 带出 ``Retry-After`` 头。
+            raise DispatcherError(
+                "rate_limited",
+                f"事件流并发连接已达上限 {sse_limiter.limit}，请稍后重试。",
+                retry_after_ms=_SSE_RETRY_AFTER_MS,
+                context={
+                    "scope": "sse_connections",
+                    "limit": sse_limiter.limit,
+                    "active": sse_limiter.active,
+                },
+            )
 
         async def gen():
             done_flag = {"v": record.status in TERMINAL_STATUSES}
@@ -553,7 +649,10 @@ def create_app(*, auth: AuthConfig | None = None) -> FastAPI:
                         done_flag["v"] = True
                     yield to_sse(ev)
             finally:
+                # 客户端断开、任务到终态、服务端取消——三条路都从这里出去，
+                # 因此名额的归还点只有这一个（``release`` 幂等，重复调用无害）。
                 watcher.cancel()
+                lease.release()
 
         return StreamingResponse(
             gen(),
