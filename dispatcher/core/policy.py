@@ -121,6 +121,20 @@ class RouterConfig(BaseModel):
     options: dict[str, Any] = {}
 
 
+class DirectLLMConfig(BaseModel):
+    """直答（``path=direct_llm``）自己的超时与供应商参数。
+
+    **档位不在这里**：它来自路由决策（``direct_answer`` 的 ``default_tier``）。
+    "用哪个档位"是路由要选的东西，直答不该有主张——与 handler 拿不到模型名是
+    同一条纪律。这里只有"这一次补全怎么发出去"。
+    """
+
+    model_config = StrictModel
+    timeout_ms: int
+    requires: list[str]
+    options: dict[str, Any] = {}
+
+
 class DecomposerConfig(BaseModel):
     model_config = StrictModel
     tier: str
@@ -186,6 +200,7 @@ class Policy(BaseModel):
     fallback: Fallback
     evaluator: EvaluatorConfig
     router: RouterConfig
+    direct_llm: DirectLLMConfig
     decomposer: DecomposerConfig
     limits: Limits
     evolution: EvolutionConfig
@@ -233,6 +248,14 @@ class Policy(BaseModel):
         for src, dst in self.thresholds.escalation_tiers.items():
             if src not in tiers or dst not in tiers:
                 raise ValueError(f"escalation_tiers 含未定义档位：{src} -> {dst}")
+
+        # 直答的能力需求必须至少有一个档位能满足。否则 direct_answer 路由会**永远
+        # 发不出去**——那是静态可判定的，不该等到第一次真跑才撞上（与
+        # config/agents.yaml 里角色的能力可满足性检查同一条理由）。
+        if not self.resolve_tier(self.direct_llm.requires, list(tiers)):
+            raise ValueError(
+                f"direct_llm.requires={self.direct_llm.requires} 没有任何档位能满足"
+            )
 
         object.__setattr__(self, "_routes_by_id", {r.id: r for r in self.routes})
         object.__setattr__(self, "_locked_tiers", frozenset(tiers))

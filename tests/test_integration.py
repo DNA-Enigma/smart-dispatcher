@@ -115,6 +115,33 @@ SCHEDULE_DECISION = {
 # parse_natural_time 的产出（它自己会调一次模型）。
 PARSE_TIME = {"iso": "2026-10-07T15:00:00+08:00", "ambiguous": False, "note": ""}
 
+DIRECT_PROFILE = {
+    "task_type": "chat.explain",
+    "intent_summary": "解释复利是什么",
+    "complexity": {"score": 0.1, "reasons": ["单步问答"]},
+    "urgency": {"level": "normal"},
+    "candidate_capabilities": [],
+    "required_capabilities": [],
+    "recommended_mode": "sync",
+    "needs_clarification": False,
+    "confidence": 0.95,
+}
+
+# **没有 handler、没有 tool_set**——这不是偷懒，是契约的要求：
+# schemas/route_decision.json 规定 path=direct_llm 时 handler 必须为 null、
+# tool_set 必须为空，PolicyGuard 也会主动清空它们。
+DIRECT_DECISION = {
+    "route_id": "direct_answer",
+    "model_tier": "cheap",
+    "execution_mode": "sync",
+    "decompose": False,
+    "budget": {"max_cost": 0.003, "max_wall_ms": 20000, "max_llm_calls": 2},
+    "rationale": "常识解释，无副作用、不需要私有数据。",
+    "confidence": 0.92,
+}
+
+DIRECT_ANSWER = {"answer": "复利是利息也生利息。", "confidence": 0.88}
+
 CATEGORIZE_PROFILE = {
     "task_type": "bookkeeping.categorize_merchants",
     "intent_summary": "把一批陌生商户归类",
@@ -320,6 +347,135 @@ async def test_schedule_template_parses_time_then_creates_event():
         assert event["start"] == PARSE_TIME["iso"]
         assert event["title"] == "明天下午三点开会"
         assert event["token"].startswith(cur.task_id)
+    finally:
+        await d.aclose()
+
+
+# ---------------------------------------------------------------------------
+# 第三种执行路径：直答（path=direct_llm）
+# ---------------------------------------------------------------------------
+async def test_direct_llm_answers_without_any_handler():
+    """直答 = 一次补全。**没有 handler，也没有节点。**
+
+    这条是回归测试，钉住的是一个 502：``path=direct_llm`` 从来没被执行过，
+    走这条路由的请求会落进拆解器"单步工具调用"的构造里，产出一个
+    ``handler=""``、``tool=None`` 的节点，执行器在 registry 里找不到实现，
+    任务以 502 ``handler_error``「handler  已声明但没有可执行实现」收场。
+    消费端看到的现象是"问账、归类都报 502"。
+
+    因此这里断言的重点不是"有答案"，而是**那段曾经产出幽灵节点的构造路径
+    没有被走到**：没有计划、没有节点、没有 subtask 事件，答案直接进 artifacts。
+    """
+    llm = ScriptedLLM([DIRECT_PROFILE, DIRECT_DECISION, DIRECT_ANSWER])
+    d = make_dispatcher(llm)
+    try:
+        rec = await d.submit(text_env("复利是什么", mode="sync"))
+        assert rec.status == "succeeded", rec.error
+        assert rec.decision.path == "direct_llm"
+        # 契约：这条路径上没有 handler 的概念。
+        assert rec.decision.handler is None
+        assert rec.decision.tool_set == []
+        # **没有计划**，因此也没有任何节点——幽灵节点正是那个 bug 的形态。
+        assert rec.plan is None
+        assert rec.node_runs == {}
+        assert rec.artifacts["answer"] == DIRECT_ANSWER["answer"]
+        assert rec.artifacts["confidence"] == 0.88
+        assert rec.progress == 1.0, "没有计划的终态任务，进度按终态折算"
+
+        events = await d.state.read_events(rec.task_id)
+        kinds = [e.type for e in events]
+        assert "subtask.started" not in kinds and "subtask.completed" not in kinds
+        assert kinds[-1] == "task.completed"
+        # 答案也进事件流，断线重连的客户端因此拿得到它（token 事件的契约形状
+        # 就是"模型产出的那段文本"）。
+        assert [e.data.get("token") for e in events if e.type == "token"] == [
+            DIRECT_ANSWER["answer"]
+        ]
+
+        # 三次调用：评估 + 路由 + 直答。**直答只发一次**——它不是拆解，没有节点。
+        assert len(llm.calls) == 3, [c.tier for c in llm.calls]
+        last = llm.calls[-1]
+        assert last.tier == "cheap", "档位来自路由决策，不是硬编码的"
+        # 策略里 direct_llm 那一段必须真的生效，不能是死配置
+        assert last.timeout_ms == d.policy.direct_llm.timeout_ms
+        assert last.options.get("thinking") == {"type": "disabled"}
+    finally:
+        await d.aclose()
+
+
+async def test_direct_llm_keeps_an_unstructured_answer_instead_of_failing():
+    """模型没按约定包成 JSON 时，**那段话仍然要交给用户**。
+
+    要交付的是答案，JSON 只是它的包装。若这里抛错，最可能发生的降级情形
+    （模型直接答了一段话）反而会让任务失败——而那段话正是用户要的东西。
+    但也不能装作没这回事：artifact 上带 ``degraded`` 痕迹，提示词或供应商
+    哪天悄悄变了，翻产物就能看出来。
+    """
+    llm = ScriptedLLM([DIRECT_PROFILE, DIRECT_DECISION, "复利是利息也生利息，就这么简单。"])
+    d = make_dispatcher(llm)
+    try:
+        rec = await d.submit(text_env("复利是什么", mode="sync"))
+        assert rec.status == "succeeded", rec.error
+        assert rec.artifacts["answer"] == "复利是利息也生利息，就这么简单。"
+        assert rec.artifacts["degraded"] == "unstructured_output"
+        assert "confidence" not in rec.artifacts, "没有结构化输出就没有可信的置信度"
+    finally:
+        await d.aclose()
+
+
+async def test_direct_llm_treats_an_empty_answer_as_a_failure_not_prose():
+    """``{"answer": ""}`` 是"这次没答出来"，**不是**"降级成纯文本"。
+
+    两者的区别在于模型有没有打算用那个包装。它按约定说了话、却没给出内容，
+    这时把整段 ``{"answer": ""}`` 当答案交给用户是最糟的处理——用户会看到
+    一段 JSON。因此这条必须是失败，而"解出来不是对象"那条才是降级。
+    """
+    llm = ScriptedLLM([DIRECT_PROFILE, DIRECT_DECISION, {"answer": "   "}])
+    d = make_dispatcher(llm)
+    try:
+        rec = await d.submit(text_env("复利是什么", mode="sync"))
+        assert rec.status == "failed", rec.error
+        assert rec.error["code"] == "upstream_llm_error", rec.error
+        assert rec.artifacts is None
+    finally:
+        await d.aclose()
+
+
+async def test_direct_llm_provider_failure_does_not_look_like_a_handler_bug():
+    """直答那一次上游抖动 → 任务 ``failed`` + ``upstream_llm_error``。
+
+    两个断言各自钉一件事：
+
+    * **不是 ``handler_error``。** 两者都是 502，却指向完全不同的排查方向——
+      一个查供应商，一个查 handler 注册。直答路径上没有 handler，
+      报 handler 错会把人带偏（这正是最初那个 502 的误导之处）。
+    * **是 ``failed`` 而不是 ``rejected``。** rejected 的意思是"守卫没能产出合法决策、
+      什么都没跑"；这里决策是合法的、任务真的跑到了直答这一步。
+      而且它**不能被一路抛成未捕获异常**——上游抖动是常态，不该变成一个 500。
+    """
+    from dispatcher.ports.llm import LLMError
+
+    class FailsOnTheDirectCall(ScriptedLLM):
+        """评估、路由正常，**第三次调用**（直答）上游挂掉。
+
+        用子类而不是 ``fail_first_n``：那个只能让"前 N 次"失败，而这里要的是
+        最后一次失败——前两次必须先跑通，否则根本走不到直答。
+        """
+
+        async def complete(self, messages, **kw):
+            if len(self.calls) >= 2:
+                raise LLMError("上游 502", retryable=True)
+            return await super().complete(messages, **kw)
+
+    llm = FailsOnTheDirectCall([DIRECT_PROFILE, DIRECT_DECISION])
+    d = make_dispatcher(llm)
+    try:
+        rec = await d.submit(text_env("复利是什么", mode="sync"))
+        assert rec.status == "failed", rec.error
+        assert rec.error["code"] == "upstream_llm_error", rec.error
+        assert rec.error["retryable"] is True
+        assert rec.artifacts is None, "答不出来就不该有答案"
+        assert rec.decision.route_id == "direct_answer", "走到的是直答，不是兜底路由"
     finally:
         await d.aclose()
 

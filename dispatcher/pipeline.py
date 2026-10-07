@@ -54,6 +54,7 @@ from .ports.llm import LLMPort
 from .ports.media import MediaStorePort
 from .ports.state import StateStorePort
 from .stages.decomposer import Decomposer
+from .stages.direct import DirectAnswerer
 from .stages.evaluator import Evaluator
 from .stages.router import Router
 
@@ -129,6 +130,10 @@ class Dispatcher:
             policy=policy, registry=registry, agents=agents, prompts=prompts,
             llm=llm, templates_dir=Path(prompts._root).parent / DEFAULT_TEMPLATE_DIR,
             pricing=pricing,
+        )
+        # 第三种执行路径。它不进拆解——直答没有步骤。
+        self.direct = DirectAnswerer(
+            policy=policy, pricing=pricing, prompts=prompts, llm=llm
         )
         self.media_resolver = MediaResolver(media)
         if evolution_store is not None:
@@ -284,6 +289,9 @@ class Dispatcher:
             policy=new_policy, registry=self.registry, agents=self.agents,
             prompts=self.prompts, llm=self.llm,
             templates_dir=self.decomposer._templates_dir, pricing=self.pricing,
+        )
+        self.direct = DirectAnswerer(
+            policy=new_policy, pricing=self.pricing, prompts=self.prompts, llm=self.llm
         )
         setter = getattr(self.llm, "set_policy", None)
         if callable(setter):
@@ -525,6 +533,20 @@ class Dispatcher:
                 await self.events.emit(task_id, "task.failed", {"error": record.error})
                 return record
 
+            # ---- 02.5 直答（path=direct_llm）：一次补全，没有计划 ----
+            #
+            # 放在拆解**之前**：直答没有步骤，因此没有计划。以前它掉进下面那段
+            # "单步工具调用"的构造里，产出一个 handler 为空的节点，执行器在
+            # registry 里找不到实现 → 502 handler_error（见 stages/direct.py 的说明）。
+            #
+            # ``stop_after_planning`` 这一趟只做评估/路由/拆解来决定"这一侧等不等"，
+            # 因此这里先交回去；真正的补全在下一次 _advance（或后台任务）里发生。
+            # 这也让 async 的直答真的异步——不然调用方会为一次同步补全白等。
+            if record.decision.path == "direct_llm":
+                if stop_after_planning:
+                    return record
+                return await self._answer_directly(record, envelope, handle)
+
             # ---- 03 拆解 ----
             if record.plan is None:
                 record.status = "planning"
@@ -643,6 +665,41 @@ class Dispatcher:
             if e.fatal:
                 raise
             return record
+
+    # ------------------------------------------------------------------
+    async def _answer_directly(
+        self, record: TaskRecord, envelope: TaskEnvelope, handle: Any
+    ) -> TaskRecord:
+        """跑完一条直答路径并落终态。
+
+        **状态机仍然归调度层**：直答只产出一段话与一笔账，改状态、发事件都在这里，
+        与节点执行走 runner 是同一条纪律（handler 不能改状态）。
+
+        事件流里补一条 ``token``：它的契约形状就是"模型产出的那段文本"，
+        断线重连的客户端因此能拿到答案，而不是只看到路由决策之后直接跳到终态。
+        """
+        assert record.decision is not None  # 只有在路由之后才会走到这里
+        task_id = record.task_id
+        record.status = "running"
+        await self._save(record)
+
+        outcome = await self.direct.answer(envelope, record.decision, budget=handle)
+
+        record.artifacts = outcome.artifact()
+        record.budget_spent = self.ledger.spent(task_id)
+        record.budget_warned = self.ledger.warned(task_id)
+        record.status = "succeeded"
+        record.ended_at = datetime.now(UTC)
+        await self._save(record)
+
+        await self.events.emit(task_id, "token", {"token": outcome.answer})
+        await self._emit_run_log(record)
+        await self.events.emit(
+            task_id, "task.completed",
+            {"task_id": task_id, "status": "succeeded", "artifacts": record.artifacts,
+             "cost": {"amount": record.budget_spent, "currency": self.ledger.currency}},
+        )
+        return record
 
     # ------------------------------------------------------------------
     async def clarify(self, task_id: str, answer: dict) -> TaskRecord:
