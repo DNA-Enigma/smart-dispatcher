@@ -283,6 +283,31 @@ async def test_escalation_is_bounded_by_the_given_limit():
     assert all(t is None for t in ex.tiers_used["a"])
 
 
+async def test_a_no_op_escalation_is_not_claimed():
+    """升档目标等于当前档位时，**不许假装升过档**。
+
+    ``thresholds.escalation_tiers`` 里 ``strong`` 映射到自己。若在这里仍然扣额度、
+    发一条 ``task.escalated``，事件流里就留下一句假话：说升了档，实际用的还是同一档。
+    2026-10-07 的 extract 故障正是这个形状——只不过起点报错（``node.model_tier``
+    为 None 退化成 ``cheap``），于是 "cheap → standard" 看起来是升档，
+    而节点本来就在 ``standard`` 上跑。
+
+    判据是"有没有真的换档位"，不是"有没有进过升档分支"。
+    """
+    ex = FakeExecutor(
+        {"a": lambda n, a, t, s: ToolResult.fail("schema_validation_failed", "x")}
+    )
+    runner, _, store = build(ex)
+    report = await runner.run(
+        plan_of(node("a", model_tier="strong")), task_id="t1", scope={}, max_escalations=1
+    )
+    assert report.status == "failed"
+    assert ex.tiers_used["a"] == [None], "strong 已是最强档，不该有第二趟"
+    assert report.nodes["a"].attempts == 1
+    types = [e.type for e in await store.read_events("t1")]
+    assert "task.escalated" not in types, "没换档位就不许说升了档"
+
+
 # ---------------------------------------------------------------------------
 # 取消
 # ---------------------------------------------------------------------------

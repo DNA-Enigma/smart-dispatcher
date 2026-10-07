@@ -252,6 +252,36 @@ def test_flow_template_max_parallelism_within_limits(repo_root: Path, policy: Po
         assert tpl["max_parallelism"] <= policy.limits.max_parallelism, p.name
 
 
+#: 模板里允许出现的、**不是档位名**的哨兵。每个哨兵都必须有代码在解析它
+#: （当前只有 ``Decomposer._declared_tier`` 认 ``vision`` → 决策里的 vision_tier）。
+_TIER_SENTINELS = frozenset({"vision"})
+
+
+def test_flow_template_tiers_are_real_tiers_or_known_sentinels(repo_root: Path, policy: Policy):
+    """模板节点写的 ``tier`` 必须是真实档位名，或者是**有代码在解析**的哨兵。
+
+    这是 2026-10-07 extract 故障的防线。``tier: vision`` 读起来像个档位名，
+    而策略里根本没有叫 ``vision`` 的档位：它被原样塞进 ``Node.model_tier``，
+    而 runner 的升档起点正是这个字段——起点报错，升档目标就落回节点当前正在用的
+    档位，"升档重试"于是变成原地重跑。拼错一个真实档位名（``standrad``）同样会静默
+    失效，所以这里一并挡掉。
+
+    ``None`` 是合法的：它表示"不指定档位，由 requires 解析"。
+    """
+    for p in sorted((repo_root / "config" / "flow_templates").glob("*.yaml")):
+        tpl = load_yaml(p)
+        for node in tpl["nodes"]:
+            tier = node.get("tier")
+            if tier is None:
+                continue
+            assert tier in policy.model_tier_ids or tier in _TIER_SENTINELS, (
+                f"{p.name}/{node['id']} 的 tier={tier!r} 既不是已定义的档位 "
+                f"{tuple(policy.model_tier_ids)}，也不是认得的哨兵 {sorted(_TIER_SENTINELS)}"
+                f"——它会被 Decomposer 当成 None 丢掉，而丢掉之后升档就没法从正确的"
+                f"档位起算"
+            )
+
+
 def test_route_flow_template_hint_resolves_to_a_real_template(repo_root: Path, policy: Policy):
     """路由的 ``flow_template_hint`` 必须指向一个真实存在的模板文件。
 

@@ -232,8 +232,16 @@ class DagRunner:
             )
 
             attempt = 1
+            # **实际执行了几次**，与 ``attempt`` 分开记。
+            #
+            # ``attempt`` 是"第几次重试"，升档走的是一条不增加 attempt 的旁路
+            # （见下面的 continue），所以它数不出升档那一趟。原先 ``attempts`` 报的就是
+            # ``attempt``，于是"跑了两趟、其中一趟是升档"在 node_runs 里显示成 1 次——
+            # 排查的人看到的执行次数比真实发生的少，而这正是复盘时最容易走错的一步。
+            executions = 0
             result = ToolResult.fail("handler_error", "节点未执行")
             while True:
+                executions += 1
                 self._cancel.raise_if_cancelled()
                 # 每次尝试都重新拼 scope：重试期间上游产出可能已经变了
                 # （虽然本节点的依赖已固定，但把最新快照传下去不会有坏处，
@@ -251,7 +259,7 @@ class DagRunner:
                     # 而事件流里只会留下一个"任务挂了"——那不叫可观测。
                     result = ToolResult.fail("handler_error", str(e), retryable=False)
 
-                run.attempts = attempt
+                run.attempts = executions
                 if result.cost:
                     node_cost += result.cost
                     self._ledger.charge(
@@ -262,6 +270,13 @@ class DagRunner:
                 # 档位升级：输出不合 schema 时换更强的模型重试一次。
                 # 条件是"可升级 + 还有额度 + 本次尚未升级过"——三个都必须满足，
                 # 因为无界升级就是无界花钱。
+                #
+                # 升档的**起点必须是真的在用的那个档位**。``escalation_target`` 是一张
+                # 有限的对映表（``thresholds.escalation_tiers``），起点报错就会升到同一个
+                # 档位：算是一次"升档"，实际什么都没变，白花一次重试的钱，
+                # 而且在事件流里留下一句"已升档"的假话（2026-10-07 的 extract 故障）。
+                # 因此能不能升、升到哪，先算清楚，**算不出去就不算数**：
+                # 额度只在真的换了档位时才扣。
                 if (
                     not result.ok
                     and result.failure is not None
@@ -269,10 +284,11 @@ class DagRunner:
                     and escalation_left > 0
                     and tier_override is None
                 ):
-                    escalation_left -= 1
                     base_tier = node.model_tier or self._policy.model_tier_ids[0]
-                    tier_override = self._policy.escalation_target(base_tier)
-                    if tier_override != base_tier:
+                    target_tier = self._policy.escalation_target(base_tier)
+                    if target_tier != base_tier:
+                        escalation_left -= 1
+                        tier_override = target_tier
                         run.escalated_from = base_tier
                         await self._events.emit(
                             task_id, "task.escalated",
@@ -303,7 +319,7 @@ class DagRunner:
                 attempt += 1
 
             return _AttemptResult(
-                subtask_id=sid, result=result, attempts=attempt,
+                subtask_id=sid, result=result, attempts=executions,
                 tier_override=tier_override, node_cost=node_cost,
             )
 

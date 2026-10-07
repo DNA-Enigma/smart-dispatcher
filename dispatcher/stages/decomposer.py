@@ -121,6 +121,21 @@ class Decomposer:
             return tpl
         return None
 
+    def _declared_tier(self, declared: Any, decision: RouteDecision) -> str | None:
+        """把模板里写的 ``tier`` 读成**真实存在的档位名**；读不出来就返回 None。
+
+        ``vision`` 是模板专用哨兵：模板说的是"这一步用决策里的 vision_tier"
+        （见 ``receipt_to_entry.yaml`` 里 extract 节点那行的注释），它不是一个档位名。
+        哨兵从没有被实现过，于是 ``tier: vision`` 一路被当成档位名传下去。
+
+        认不出来一律返回 None 而不是原样透传：往 ``Node.model_tier`` 里放一个不存在的
+        档位名，会让"档位"这个字段在观测与升档起点上同时失去意义，而失败会推迟到很远
+        的地方才显现。宁可显式地"没有档位"，由 ``resolve_tier`` 按能力需求去解析。
+        """
+        if declared == "vision":
+            declared = decision.vision_tier
+        return declared if declared in self._policy.model_tier_ids else None
+
     def _from_template(
         self, tpl: dict, decision: RouteDecision, task_id: str
     ) -> ExecutionPlan:
@@ -143,12 +158,21 @@ class Decomposer:
             }
             if n["executor"] == "tool":
                 body["tool"] = n["tool"]
-                body["model_tier"] = n.get("tier")
             else:
                 body["role"] = n["role"]
                 body["tool_whitelist"] = list(n.get("tool_whitelist") or [])
                 body["max_rounds"] = n.get("max_rounds")
                 body["on_round_limit"] = n.get("on_round_limit")
+            # 档位对两种执行器都要接上，**agent 节点也要**。
+            #
+            # 原来的实现只在 executor=tool 那一支赋值，于是模板里 agent 节点写的
+            # ``tier:`` 被静默丢弃、``node.model_tier`` 恒为 None。后果不止是观测里
+            # ``node_runs[].tier`` 为空：runner 升档时以 ``node.model_tier`` 为起点
+            # （见 ``runner.run_node``），None 会退化成 ``model_tier_ids[0]``（最便宜的
+            # 档），而节点实际跑的是由 ``requires`` 解析出来的档位——两者常常不是同一个，
+            # 于是"升档重试"升到了当前正在用的档位，白跑一轮后再失败一次
+            # （2026-10-07 的 extract 故障就是这个形状）。
+            body["model_tier"] = self._declared_tier(n.get("tier"), decision)
             if n.get("retry"):
                 body["retry"] = Retry(**n["retry"])
             if n.get("verification"):

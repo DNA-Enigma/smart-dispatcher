@@ -56,7 +56,11 @@ nodes:
     role: receipt_extractor
     tool_whitelist: [extract_receipt_fields, crop_and_zoom, read_media_region]
     requires: [vision.extract, text]
-    tier: vision                    # 使用决策中的 vision_tier
+    # `vision` 是模板专用的哨兵，不是档位名：意思是"用本次决策里的 vision_tier"。
+    # 由 Decomposer._declared_tier 解析（它认不出真实档位名时一律给 None，不硬塞）。
+    # 写清楚这点很重要——它曾经被当成一个不存在的档位名一路传下去，而升档的起点
+    # 正是这个字段，于是"升档重试"升到了当前正在用的档位（2026-10-07 故障）。
+    tier: vision
     max_rounds: 4
     on_round_limit: escalate_and_retry
     depends_on: []
@@ -66,6 +70,12 @@ nodes:
       media_ref: { $ref: "envelope.input.media[0].media_id" }
       text_hint: { $ref: "envelope.input.text" }
     output_schema_ref: bookkeeping.ReceiptFields
+    # **单位是"每次 LLM 调用"，不是"每个节点"。** 这一点被误读过不止一次
+    # （见 tests/test_node_timeout.py 与 docs/02-stages.md）：4 轮 agent 循环
+    # 最坏可以跑 4×20000ms 而不超时——runner 里没有任何节点级墙钟。
+    # 另外注意：真正贵的那次视觉调用发生在 extract_receipt_fields 工具内部，
+    # 走的是全局默认超时（settings.llm_request_timeout_s），**不**受这里约束。
+    # 所以这 20000 管的是 agent 自己的那几轮文本轮次，20s 是宽裕的。
     timeout_ms: 20000
     retry: { max: 1, backoff_ms: 500 }
     idempotent: true

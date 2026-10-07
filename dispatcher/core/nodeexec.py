@@ -186,6 +186,11 @@ class NodeExecutor:
         max_rounds = min(role.max_rounds, self._policy.limits.max_agent_rounds)
         if node.max_rounds:
             max_rounds = min(max_rounds, node.max_rounds)
+        # 轮数**不因升档而放宽**（``tier_override`` 非空 = 这是升档后的那一趟）。
+        # 升档改的是"用更强的模型"，再顺手加轮数就等于一次改了两个变量：真变好了
+        # 也说不清是模型的功劳还是预算的功劳，而这两者的成本含义完全不同。
+        # 轮数是有界循环的硬界（还要被 limits.max_agent_rounds 再夹一次），
+        # 该修的是"模型为什么在 4 轮里收敛不了"（提示词），不是把界放宽。
 
         # 角色提示词里可用的模板变量就这几个，一次给全。**不给超集**——
         # fill 是严格的，多给不会出错，但少给会当场报错，那正是我们要的：
