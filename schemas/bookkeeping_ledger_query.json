@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://smart-dispatcher.dev/schemas/bookkeeping_ledger_query.json",
+  "title": "bookkeeping.LedgerQuery",
+  "description": "`query_ledger` 的产出：**一份查询结构（LedgerQuerySpec），不是账目**。\n\n> **这个工具以前去读服务端自己的账本，那是错的。** 账本在用户手机的 Room 库里，服务端永远拿不到，于是它恒返回空表。真正要产出的是「怎么查」——消费端拿这份结构在本机 SQL 里聚合，账目一个字节都不出设备。判定（问句→结构）在服务端，算术在消费端。\n\n**direction 判不出时必须整键省略，绝不默认成 `expense`。** 默认成 expense 会把「我这个月收入多少」静默答成一个支出数字，用户不会察觉自己看到的不是自己问的。省略之后消费端会如实说「调度层没能把这个问题翻译清楚」——好过给一个方向都不确定的查询算出看着挺像的错数字。\n\n**category 与 merchant 是两件事**：`category` 必须精确匹配该用户的分类词表里的名字，`merchant` 是商户/对方的名字（包含匹配）。中文无词边界，「交通银行」里含分类名「交通」——把前者认成后者会让 `LIKE '%交通银行%'` 匹配不到任何商户、答「没有记录」。二者判定交给模型，词表在判定时注入，不做关键词匹配表。\n\n**挂载位置**：消费端在 `artifacts` 里递归找任何含 `direction` 键的对象。单步路径下本结构就挂在 `artifacts.main` 上（节点名 `main`），与 `single_tool_action` 现状一致。",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "from": {
+      "type": ["string", "null"],
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+      "description": "起始日期 ISO `yyyy-MM-dd`。省略 = 不设下限（「一共花了多少」）。与 `to` 同时给出时必须 `from <= to`，否则消费端整条作废。"
+    },
+    "to": {
+      "type": ["string", "null"],
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+      "description": "结束日期 ISO `yyyy-MM-dd`，**闭区间**。省略 = 不设上限。"
+    },
+    "direction": {
+      "type": ["string", "null"],
+      "enum": ["expense", "income", "both", null],
+      "description": "收支方向。**能判就必填，判不出就整键省略**（不要写 null 再指望消费端忽略——客户端的判别键就是这个键在不在）。大小写不敏感，产出一律小写。"
+    },
+    "category": {
+      "type": ["string", "null"],
+      "description": "分类名，**精确匹配**，取自该用户的分类词表。不是商户名的一部分；词表里没有它就省略这个键，不要把商户名硬塞进来。"
+    },
+    "merchant": {
+      "type": ["string", "null"],
+      "description": "商户/对方名字，**包含匹配**。原样保留用户的写法，不做规范化（归一化是 `normalize_merchant` 的事）。"
+    },
+    "group_by": {
+      "type": ["string", "null"],
+      "enum": ["none", "category", "merchant", "month", null],
+      "description": "分组维度。不在枚举内时消费端退回 `none`（不算错误——合计仍然正确，少一层明细不至于骗人）。省略同 `none`。"
+    },
+    "limit": {
+      "type": ["integer", "null"],
+      "description": "分组最多返回几行。省略或 ≤0 时用消费端默认值。"
+    }
+  }
+}

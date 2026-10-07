@@ -11,6 +11,8 @@
 from __future__ import annotations
 
 import json
+from datetime import date
+from pathlib import Path
 from typing import Any
 
 from dispatcher.core.execution import ToolResult
@@ -19,9 +21,92 @@ from dispatcher.ports.llm import LLMMessage
 from ..base import HandlerBase
 from .ports import InMemoryLedger, LedgerPort
 
-# 用户没配分类词表时的兜底。**真实词表来自 handler 配置**（ctx.config.categories），
-# 那是用户自己的体系；写死在代码里就等于替用户决定了他怎么记账。
-FALLBACK_CATEGORIES = ["餐饮", "交通", "购物", "居住", "其他"]
+
+def _load_default_categories() -> list[str]:
+    """从数据文件读默认分类词表。**分类是数据不是代码。**
+
+    真源是客户端的 ``app/src/main/assets/default_accounts.json``；这里是服务端
+    副本，只作用户未配置分类时的兜底。运行时真正的词表来自
+    ``ctx.config.categories``——那是用户自己的体系，写死在代码里就等于替用户
+    决定了他怎么记账。
+    """
+    p = Path(__file__).with_name("default_categories.json")
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        cats = data.get("categories")
+        return [str(c) for c in cats] if isinstance(cats, list) and cats else []
+    except Exception:
+        return []
+
+
+FALLBACK_CATEGORIES = _load_default_categories()
+
+
+def _iso_day(value: Any) -> str | None:
+    """只放行 ``yyyy-MM-dd``。解析不出来的直接丢掉——客户端会因为日期非法
+    把整条 spec 作废，服务端少给一个字段好过给一个毒字段。"""
+    if not isinstance(value, str):
+        return None
+    s = value.strip()
+    try:
+        return date.fromisoformat(s).isoformat()
+    except ValueError:
+        return None
+
+
+def _sanitize_ledger_query(raw: dict) -> dict:
+    """把模型/草稿的产出清洗成消费端 ``toQuery()`` 一定吃得下的形状。
+
+    逐条对应客户端解析规则：
+
+    * ``direction`` 不在 ``{expense, income, both}`` 内 → **整键省略**（不是默认
+      expense）。消费端的判别键就是这个键在不在，缺了会如实说「翻译不了」。
+    * ``from`` / ``to`` 解析不出 ``yyyy-MM-dd`` → 丢掉该字段；``from > to`` → 对调
+      （客户端会因 from>to 把整条作废，对调保留了用户要的那个区间）。
+    * ``group_by`` 不在枚举内 → 省略（消费端退回 none，不算错误）。
+    * ``limit`` 空或 ≤0 → 省略（消费端用自己的默认值）。
+    * ``category`` / ``merchant`` 空白串 → 省略（当作没有）。
+    """
+    out: dict = {}
+
+    direction = raw.get("direction")
+    if isinstance(direction, str):
+        d = direction.strip().lower()
+        if d in {"expense", "income", "both"}:
+            out["direction"] = d
+
+    from_ = _iso_day(raw.get("from"))
+    to = _iso_day(raw.get("to"))
+    if from_ and to and from_ > to:
+        from_, to = to, from_
+    if from_:
+        out["from"] = from_
+    if to:
+        out["to"] = to
+
+    for key in ("category", "merchant"):
+        v = raw.get(key)
+        if isinstance(v, str) and v.strip():
+            out[key] = v.strip()
+
+    group_by = raw.get("group_by")
+    if isinstance(group_by, str) and group_by.strip().lower() in {
+        "none", "category", "merchant", "month",
+    }:
+        out["group_by"] = group_by.strip().lower()
+
+    limit = raw.get("limit")
+    if isinstance(limit, bool):
+        pass  # bool 是 int 的子类，但 True/False 不是合法的 limit
+    else:
+        try:
+            n = int(limit)  # type: ignore[arg-type]
+            if n > 0:
+                out["limit"] = n
+        except (TypeError, ValueError):
+            pass
+
+    return out
 
 
 class BookkeepingHandler(HandlerBase):
@@ -229,8 +314,70 @@ class BookkeepingHandler(HandlerBase):
         )
 
     async def tool_query_ledger(self, args: dict, ctx: Any) -> ToolResult:
-        entries = await self._ledger.recent(limit=100)
-        return ToolResult(ok=True, output={"entries": entries, "count": len(entries)})
+        """**产出一份查询结构（LedgerQuerySpec），不是账目。**
+
+        以前这里去读服务端自己的账本（``self._ledger.recent``），那是错的：
+        账本在用户手机的 Room 库里，服务端永远拿不到，于是恒返回空表、答不了
+        「这个月餐饮花了多少」。真正要产出的是**怎么查**——消费端拿这份结构在
+        本机 SQL 里聚合。判定（问句→结构）在服务端，算术在消费端；账目一个
+        字节都不出设备。
+
+        判定发生在**本工具内部的一次 ``ctx.llm_json`` 补全**里，而不是单步路由的
+        参数抽取那一步。理由是「分类 vs 商户」必须要**用户自己的分类词表**
+        （``ctx.config.categories``）才能判：参数抽取只看得见 ``handler.yaml``
+        里那份静态描述，看不见该用户的配置。把词表写进静态描述会多出一份会漂移
+        的副本（「交通银行」的坑正是词表对不上造成的）。词表在调用时注入提示词，
+        主判定交给模型，不做关键词匹配表。
+
+        兜底：模型调用失败时**退到参数抽取给的草稿**（按消费端解析规则清洗后
+        原样搬出），不猜、不补默认方向。草稿也没有时就只产出空结构——
+        消费端看到缺 ``direction`` 会如实说「翻译不了」，好过算出看着挺像的错数字。
+        """
+        question = str(args.get("question") or "").strip()
+        draft = {
+            k: args.get(k)
+            for k in ("from", "to", "direction", "category", "merchant", "group_by", "limit")
+        }
+        categories = self._categories(ctx)
+
+        raw: dict = {}
+        if question or any(v is not None and str(v).strip() for v in draft.values()):
+            raw = await self._judge_ledger_query(question, draft, categories, ctx)
+        return ToolResult(ok=True, output=_sanitize_ledger_query(raw))
+
+    async def _judge_ledger_query(
+        self, question: str, draft: dict, categories: list[str], ctx: Any
+    ) -> dict:
+        """问句 → 查询结构。词表注入提示词，主判定交给模型。"""
+        prompt = (
+            "把用户的问题翻译成一份账目查询结构。只输出一个 JSON 对象。\n"
+            f"用户原话：{question or '（未提供原话）'}\n"
+            f"初步草稿（可能有错，以用户原话为准）：{json.dumps(draft, ensure_ascii=False)}\n"
+            f"该用户的分类词表（category 只能取自这里，精确匹配）：{categories}\n"
+            "字段与规则：\n"
+            '- direction: "expense" | "income" | "both"。判不出方向就**整键省略**，'
+            "绝不默认成 expense——猜错方向会把「收入多少」静默答成支出数字。\n"
+            "- category: 分类名，必须精确匹配上面词表里的名字。category 不是商户名。\n"
+            "- merchant: 商户/对方的名字（包含匹配）。**「交通银行」是商户名，"
+            "不是分类「交通」**——中文无词边界，别把商户名里嵌着的分类名当成 category。\n"
+            '- from / to: 日期，格式 `yyyy-MM-dd`，闭区间。「这个月」这类相对时间'
+            "换算成具体日期。\n"
+            '- group_by: "none" | "category" | "merchant" | "month"。用户要分类明细、'
+            "商户明细或按月趋势时才给，只问合计就省略。\n"
+            "- limit: 分组最多返回几行。\n"
+            "省略的字段**不要放键**。不要输出解释文字，只输出 JSON。"
+        )
+        try:
+            raw, _res = await ctx.llm_json(
+                [LLMMessage.user(prompt)],
+                requires=("text",),
+                note="query_ledger",
+            )
+            return raw if isinstance(raw, dict) else draft
+        except Exception:
+            # 兜底触发条件：模型调用失败或输出不是 JSON 对象。
+            # 退到草稿（后面 _sanitize_ledger_query 会按消费端规则清洗），不猜方向。
+            return draft
 
     async def tool_compare_entries(self, args: dict, ctx: Any) -> ToolResult:
         return ToolResult(ok=True, output={"differences": []})

@@ -95,6 +95,42 @@ tools:
           description: 待归类的商户名列表，保持用户给的原始写法。
         text_hint: { type: string, description: 用户附带的说明，可选 }
 
+  # 查询：产出的是**查询结构**，不是账目。账本在消费端本地库里，服务端拿不到；
+  # 判定（问句→结构）需要用户分类词表，所以这一跳要模型。
+  - name: query_ledger
+    description: >
+      把「这个月餐饮花了多少」这类问句翻译成一份账目查询结构（LedgerQuerySpec），
+      由消费端在本机 SQL 里聚合。**不返回账目本身**——账本在用户设备上，服务端读不到。
+      category 是用户分类词表里的名字（精确匹配），merchant 是商户/对方名字（包含匹配）；
+      二者判定需要用户的分类词表，在工具内部完成。direction 判不出时省略该键，不默认成 expense。
+    side_effects: read
+    requires_capabilities: [text]
+    idempotent: true
+    output_schema_ref: bookkeeping.LedgerQuery
+    # **必须声明。** 理由与 build_ledger_entry 相同：参数抽取环节靠它决定产出的形状。
+    # 不声明的话抽取器只能猜，而猜错的后果是「查不出东西却报成功」——
+    # 与写路径的空记录同一种病。question 是判定的依据，其余字段是可选草稿。
+    input_schema:
+      type: object
+      properties:
+        question:
+          type: string
+          description: >
+            用户原话（如「这个月餐饮花了多少」）。判定的唯一依据，尽量原样传入。
+        from: { type: string, description: "草稿：起始日期 yyyy-MM-dd，可省略" }
+        to: { type: string, description: "草稿：结束日期 yyyy-MM-dd，可省略" }
+        direction:
+          type: string
+          enum: [expense, income, both]
+          description: 草稿：收支方向。判不出时不要填。
+        category: { type: string, description: "草稿：分类名（工具会用词表复核）" }
+        merchant: { type: string, description: "草稿：商户名（工具会做分类 vs 商户判别）" }
+        group_by:
+          type: string
+          enum: [none, category, merchant, month]
+          description: 草稿：分组维度。
+        limit: { type: integer, description: 草稿：分组最多几行。 }
+
   # ---- 读操作：纯查表，不需要模型 ----
   - name: dedupe_check
     description: 在最近流水中查找是否已存在同一笔往来，用于避免重复入账。
@@ -102,12 +138,6 @@ tools:
     requires_capabilities: []
     idempotent: true
     output_schema_ref: bookkeeping.DedupeResult
-
-  - name: query_ledger
-    description: 按时间范围与条件查询账目。
-    side_effects: read
-    requires_capabilities: []
-    idempotent: true
 
   - name: compare_entries
     description: 比对多笔记录之间的差异，用于对账。
