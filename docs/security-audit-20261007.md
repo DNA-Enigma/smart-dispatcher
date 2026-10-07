@@ -200,7 +200,10 @@
 | Prompt 注入三处分槽 | ✅ 已修 | `3b6f41d` — nodeexec 数据出 system；query_ledger 拆槽；_merchants 缓存按 (租户, 词表) 隔离。测试 336→344 |
 | 直答 8000ms 超时（降级成常态） | ✅ 已修 | `57e32ad` — 实测真实 prompt 7.0~19.9s，对齐客户端 30000 |
 | 判定 prompt 拿不到当天日期（UTC 容器跨日错一天） | ✅ 已修 | `57e32ad` — `DispatchContext.clock` 可注入 + `_today()` 转 Asia/Shanghai |
-| P2 健壮性六处（body 上限 / 裸 request.json / limit=-1 / dict 泄漏 / 媒体 TTL / SSE 上限） | 🔄 在跑 | 任务书 `.mimocode/tasks/be4-hardening-20261007.md` |
+| P2 健壮性六处（body 上限 / 裸 request.json / limit=-1 / dict 泄漏 / 媒体 TTL / SSE 上限） | ✅ 已修 | `28db517` — 测试 344→404；SSE 名额制 429 + Retry-After（毫秒写头时已转秒，合 RFC 7231），并补了该端点的 openapi 429 声明（「实现了没声明是悄悄扩权」） |
+| 413 复用 `media_too_large`（title 只提 Media） | ⚠️ 接受偏差 | 新增 `payload_too_large` 属契约变更（problem.json 封闭词表 + ERROR_TABLE + openapi + 客户端跟升），本轮不扩；功能正确（413 + Problem 体） |
+| 媒体 `retain_days=0`「任务结束即删」语义缩水到 1 天 | ⚠️ 接受 | store 无从判断任务何时结束；已写进 app.py / ports/media.py / .env.example。真做要在终态那一跳删图，会打断「任务跑完再取一眼图」——conformance checklist:257 仍空着，挂账 |
+| 保护集 `_media_refs` 是进程内 dict | ⚠️ 接受单进程假设 | 当前 `InMemoryMediaStore` + 单进程成立；换 Postgres/S3 时必须把「引用」下沉为存储层 pin 表 |
 | `node.name` 与 `output_schema` 仍进 system | ⬜ 未做 | be3 遗留，同类问题、审计未点名，改它要动 planner/researcher 模板 |
 | `_reviewer_system` / `_arbiter_system` 返回未 fill 的模板 | ⬜ 未做 | be3 发现，方向与注入相反（该注入的没注入） |
 | 无发放 token 端点（P2-7）、错误 detail 为空（P2-8） | ⬜ 未做 | 契约既有缺口 |
@@ -208,6 +211,7 @@
 | `per_user_daily` / `per_tenant_daily` 声明但全仓无引用 | ⬜ 未做 | 日额度形同虚设 |
 | 依赖无 lock 文件（安装不可复现）、CVE 需人工核对 | ⬜ 未做 | **上线前要处理**（审计专家 5 点名） |
 | `/docs`、`/openapi.json` 公网无鉴权可达 | ⬜ 未做 | be2 遗留决策点之一（配 token 后 `/docs` 浏览器打不开） |
+| `Last-Event-ID`/`since` 超长数字串 `int()` → 稳定 500；`?limit=abc` → 422 非 Problem 体；`sse.replay` SQL 未传 limit | ⬜ 未做 | be4 看到但点名范围外，同类缺陷、改法同为「不可信则退化/夹取」 |
 
 ### 客户端 ai-bookkeeping
 
