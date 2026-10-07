@@ -114,6 +114,8 @@ class NodeExecutor:
             _allowed_tiers=list(plan_allowed),
             _node_tier=tier_override or node.model_tier,
             _node_options=dict(self._policy.decomposer.node_defaults.get("options") or {}),
+            # 只在从澄清恢复的那一次有值：handler 据此知道"用户刚才回答了什么"。
+            clarification=scope.get("__clarification__"),
         )
 
         from .plan import resolve_inputs

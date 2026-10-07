@@ -27,6 +27,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from pydantic import ValidationError
+
 from .adapters.memory_media import InMemoryMediaStore
 from .adapters.memory_state import InMemoryStateStore
 from .adapters.openai_compat import OpenAICompatibleLLM
@@ -38,6 +40,7 @@ from .core.contract import TaskEnvelope
 from .core.errors import DispatcherError
 from .core.eventbus import EventBus
 from .core.events import TERMINAL_EVENTS
+from .core.execution import ClarificationAnswer
 from .core.nodeexec import NodeExecutor
 from .core.plan import ExecutionPlan
 from .core.policy import Policy, load_policy
@@ -435,6 +438,7 @@ class Dispatcher:
         cancel: CancellationToken,
         *,
         prior: dict | None = None,
+        clarification: Any | None = None,
         stop_after_planning: bool = False,
     ) -> TaskRecord:
         """从当前状态往前推进。会被 submit、clarify、后台执行共用。
@@ -442,6 +446,10 @@ class Dispatcher:
         ``stop_after_planning`` 让它在拆解完成后停下，把执行留给另一次调用——
         同步/异步的分流就靠它：先内联把评估、路由、拆解做完（都很快），
         再决定这一侧是等还是不等。
+
+        ``clarification`` 只在从澄清恢复时非空：它是用户对上一次
+        ``ToolResult.confirm`` 的答复，进 scope 后由节点执行器交给 handler。
+        没有它，停下来问的那一步永远收不到回答。
         """
         task_id = record.task_id
         handle = self._budget_handle(task_id)
@@ -449,6 +457,7 @@ class Dispatcher:
             "__task_id__": task_id,
             "__record__": record,
             "__handler_config__": {},
+            "__clarification__": clarification,
         }
 
         try:
@@ -614,7 +623,14 @@ class Dispatcher:
             record.max_parallelism = plan.max_parallelism
             record.budget_spent = report.spent
             record.budget_warned = self.ledger.warned(task_id)
-            record.artifacts = report.artifacts
+
+            # **已成功节点的产出要落盘。** 它是澄清恢复时的 ``prior``——少了这一步，
+            # 恢复时 prior 为空，上游节点会**从头重跑**：既白花钱，又可能产出不同的
+            # 结果，而用户刚刚确认过的正是原来那一份。文档一直写着"答复后从断点继续，
+            # 已完成节点的产出保留"，在此之前这句话没有实现。
+            record.node_outputs = {
+                sid: r.output for sid, r in report.nodes.items() if r.output is not None
+            }
 
             if report.status == "awaiting_clarification":
                 record.status = "awaiting_clarification"
@@ -627,8 +643,14 @@ class Dispatcher:
                     "blocking": True,
                     "asked_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
                 }
+                # 暂停时也要如实上报**已经产出的部分**：抽取出来的字段即使还没入账
+                # 也有价值（契约对失败/取消的要求是同一句）。RunReport.artifacts 在
+                # 暂停这条路径上是空的，用节点产出直接合成。
+                record.artifacts = record.node_outputs
                 await self._save(record)
                 return record
+
+            record.artifacts = report.artifacts
 
             if report.status == "cancelled":
                 record.status = "cancelled"
@@ -703,7 +725,17 @@ class Dispatcher:
 
     # ------------------------------------------------------------------
     async def clarify(self, task_id: str, answer: dict) -> TaskRecord:
-        """回答澄清问题，任务**从断点继续**而不是重跑。"""
+        """回答澄清问题，任务**从断点继续**而不是重跑。
+
+        三条路：
+
+        * 保留选项 id ``cancel`` —— 用户说"别做了"。任务直接置为 cancelled，
+          **暂停的那个节点不再执行**（模板里"cancel → 不执行 write / 不建日程"
+          就是这一条）。放在调度层而不是每个 handler 里，是因为"取消"与领域无关。
+        * 其余答复 —— 进 scope 交给暂停的那个节点重跑，handler 从 ``ctx.clarification``
+          读到用户答了什么。
+        * ``edits`` —— 按节点 id 覆盖上游产出（用户的修改就是真值）。
+        """
         record = await self.get(task_id)
         if record.status != "awaiting_clarification":
             raise DispatcherError(
@@ -711,29 +743,73 @@ class Dispatcher:
                 f"任务当前状态为 {record.status}，不接受澄清",
                 task_id=task_id,
             )
-        for opt in (record.clarification or {}).get("options", []):
-            if answer.get("answer_id") and opt.get("id") == answer.get("answer_id"):
-                answer.setdefault("free_text", opt.get("label"))
+        # 客户端**自己给的**自由文本与"把选项的 label 抄一份"要分开：
+        # 前者是新内容，后者只是一个决定的文字形式。下面拼进请求文本时只认前者。
+        typed_free_text = answer.get("free_text")
+        label = next(
+            (opt.get("label") for opt in (record.clarification or {}).get("options", [])
+             if answer.get("answer_id") and opt.get("id") == answer.get("answer_id")),
+            None,
+        )
+        try:
+            reply = ClarificationAnswer.model_validate(
+                {
+                    "question_id": (record.clarification or {}).get("question_id"),
+                    "answer_id": answer.get("answer_id"),
+                    # 给人看的那一份：自由文本优先，否则用选项 label
+                    "free_text": typed_free_text or label,
+                    "edits": answer.get("edits"),
+                }
+            )
+        except ValidationError as e:
+            # 形状不对（``edits`` 传成数组之类）是**请求**的问题，不是任务的问题。
+            # 不接住的话这里会是一个 500——一个本该 422 的输入错误被报成"服务端挂了"，
+            # 排查方向直接被带偏。（端点上还缺一层完整的请求校验，见 HANDOFF 第 8 节的 P1-4b。）
+            raise DispatcherError(
+                "invalid_request",
+                f"澄清答复不符合契约：{e.errors()}",
+                task_id=task_id,
+            ) from e
         record.clarification = None
         record.updated_at = datetime.now(UTC)
         await self._save(record)
 
+        if reply.is_cancel:
+            # 用户放弃了。已完成的产出**保留并如实上报**——抽出来的字段即使这次
+            # 不入账也不是垃圾，取消不是失败。
+            record.status = "cancelled"
+            record.ended_at = datetime.now(UTC)
+            record.artifacts = record.node_outputs or None
+            await self._save(record)
+            await self.events.emit(
+                task_id, "task.cancelled", {"by": "clarification:cancel"}
+            )
+            await self._emit_run_log(record)
+            return record
+
         envelope = TaskEnvelope.model_validate(record.envelope)
         cancel = self._cancels.setdefault(task_id, CancellationToken())
-        # 把答复并进请求文本，让评估与执行都看得到
-        if envelope.input.text is not None or answer.get("free_text"):
-            reply = answer.get("free_text") or answer.get("answer_id")
-            merged = (envelope.input.text or "") + f"\n（用户澄清：{reply}）"
+        # **只有客户端给的自由文本才并进请求文本。**
+        #
+        # 拼进去是为了让重新跑的步骤看得到新内容（"按截图的 38.50 记"）。而选项
+        # 是一个**决定**，它经 ctx.clarification 直达 handler——把它的 label 也拼进
+        # 用户那句话里，会污染绑着 envelope.input.text 的字段。日程就是活例子：
+        # title 直接绑原话，拼进去会让日程标题变成
+        # "下周三下午三点开会\n（用户澄清：对，就这么建）"。
+        if typed_free_text:
+            merged = (envelope.input.text or "") + f"\n（用户澄清：{typed_free_text}）"
             envelope = envelope.model_copy(
                 update={"input": envelope.input.model_copy(update={"text": merged})}
             )
         prior = dict(record.node_outputs)
-        if answer.get("edits"):
+        if reply.edits:
             # 用户的修改直接覆盖上一个成功节点的产出——那正是"人工确认"的价值所在
-            prior = {**prior, **answer["edits"]}
+            prior = {**prior, **reply.edits}
             record.node_outputs = prior
             record.artifacts = prior
-        return await self._advance(record, envelope, cancel, prior=prior)
+        return await self._advance(
+            record, envelope, cancel, prior=prior, clarification=reply
+        )
 
     async def cancel(self, task_id: str, *, reason: str = "client_requested") -> TaskRecord:
         record = await self.get(task_id)

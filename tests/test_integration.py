@@ -352,6 +352,207 @@ async def test_schedule_template_parses_time_then_creates_event():
 
 
 # ---------------------------------------------------------------------------
+# 日程确认段：歧义时停下来问（P1-e 的后半）
+# ---------------------------------------------------------------------------
+PARSE_TIME_AMBIGUOUS = {
+    "iso": "2026-10-07T15:00:00+08:00",
+    "ambiguous": True,
+    "note": "「下周三」可能指 10-07 也可能指 10-14",
+}
+
+
+async def _drain(d: Dispatcher, task_id: str) -> None:
+    """等到任务进终态或停在等人。"""
+    for _ in range(300):
+        cur = await d.get(task_id)
+        if cur.status in {"succeeded", "failed", "cancelled", "awaiting_clarification"}:
+            return
+        await asyncio.sleep(0.01)
+
+
+async def test_ambiguous_time_parks_the_task_instead_of_creating_an_event():
+    """解析有歧义时**停下来问**，而不是拿一个猜出来的时间建日程。
+
+    这是 P1-e 的后半，也是这条模板最要紧的一处：解析本身一直是对的（时间戳正确），
+    错的是**拿到一个不确定的时间就直接写**。日程建错了用户往往到点才发现。
+
+    断言的重点是"**没建**"：暂停时 create 节点根本没跑过，产物里没有 event。
+    """
+    llm = ScriptedLLM([SCHEDULE_PROFILE, SCHEDULE_DECISION, PARSE_TIME_AMBIGUOUS])
+    d = make_dispatcher(llm)
+    try:
+        rec = await d.submit(text_env("下周三下午三点开会", mode="async"))
+        await _drain(d, rec.task_id)
+        cur = await d.get(rec.task_id)
+
+        assert cur.status == "awaiting_clarification", cur.error
+        assert cur.decision.route_id == "schedule_parse_then_create"
+        conf = cur.clarification
+        assert conf["blocking"] is True
+        # 问题里带上了解析出来的那个时间——用户要确认的正是它
+        assert PARSE_TIME_AMBIGUOUS["iso"] in conf["question"]
+        assert [o["id"] for o in conf["options"]] == ["confirm", "cancel"]
+
+        # **没有日程被建出来**：create 节点压根没跑
+        assert cur.node_runs["create"]["status"] == "pending"
+        assert "create" not in cur.artifacts, "暂停时不该有 create 的产出"
+        # 已完成的部分如实上报：解析结果是有价值的，用户答复后不必再解析一次
+        assert cur.artifacts["parse"]["iso"] == PARSE_TIME_AMBIGUOUS["iso"]
+    finally:
+        await d.aclose()
+
+
+async def test_confirming_the_parsed_time_creates_the_event():
+    """答复 ``confirm`` 后**就按解析出的时间建**，且上游不重跑。
+
+    三件事一起钉住：
+
+    * **答复送达了 handler** —— 不送达的话 create_event 会再次要求确认，
+      任务在"问—答—再问"之间转圈；
+    * **上游不重跑** —— 预置响应只有 3 条（评估/路由/时间解析），恢复时若
+      parse 重跑，第 4 次调用会因"没有更多预置响应"而失败。所以
+      ``len(llm.calls) == 3`` 是"已完成节点的产出被保留"的机械证据；
+    * **标题是用户的原话** —— 选项 label 不该被拼进请求文本（它是个决定，
+      不是内容），否则日程标题会变成"下周三下午三点开会（用户澄清：对，就这么建）"。
+    """
+    llm = ScriptedLLM([SCHEDULE_PROFILE, SCHEDULE_DECISION, PARSE_TIME_AMBIGUOUS])
+    d = make_dispatcher(llm)
+    try:
+        rec = await d.submit(text_env("下周三下午三点开会", mode="async"))
+        await _drain(d, rec.task_id)
+        paused = await d.get(rec.task_id)
+        assert paused.status == "awaiting_clarification", paused.error
+
+        await d.clarify(paused.task_id, {
+            "question_id": paused.clarification["question_id"], "answer_id": "confirm",
+        })
+        await _drain(d, paused.task_id)
+        cur = await d.get(paused.task_id)
+
+        assert cur.status == "succeeded", cur.error
+        event = cur.artifacts["create"]["event"]
+        assert event["start"] == PARSE_TIME_AMBIGUOUS["iso"]
+        assert event["title"] == "下周三下午三点开会"
+        assert len(llm.calls) == 3, "parse 不该被重跑：已完成节点的产出必须保留"
+    finally:
+        await d.aclose()
+
+
+async def test_cancelling_at_the_confirmation_creates_nothing():
+    """答复 ``cancel``：任务置为 cancelled，**且不建日程**。
+
+    ``cancel`` 是**保留的选项 id**，由调度层处理（不是每个 handler 各写一遍）。
+    模板里"cancel → 不用建了"这句话，靠的就是这一条。
+    """
+    llm = ScriptedLLM([SCHEDULE_PROFILE, SCHEDULE_DECISION, PARSE_TIME_AMBIGUOUS])
+    d = make_dispatcher(llm)
+    try:
+        rec = await d.submit(text_env("下周三下午三点开会", mode="async"))
+        await _drain(d, rec.task_id)
+        paused = await d.get(rec.task_id)
+
+        await d.clarify(paused.task_id, {
+            "question_id": paused.clarification["question_id"], "answer_id": "cancel",
+        })
+        cur = await d.get(paused.task_id)
+
+        assert cur.status == "cancelled", cur.error
+        assert "create" not in (cur.artifacts or {}), "说了不建就不该建"
+        # 已解析出来的结果保留并如实上报——取消不是失败，产出不是垃圾
+        assert cur.artifacts["parse"]["iso"] == PARSE_TIME_AMBIGUOUS["iso"]
+        assert cur.node_runs["create"]["status"] == "pending"
+        events = await d.state.read_events(cur.task_id)
+        assert events[-1].type == "task.cancelled"
+    finally:
+        await d.aclose()
+
+
+async def test_edits_let_the_user_fix_the_time_instead_of_answering_the_question():
+    """客户端给出改好的解析结果（``edits``）→ 按新时间建，不再问。
+
+    这是"改一下时间"那条路的实现方式：客户端把修正后的 parse 产出按**节点 id**
+    覆盖回来，``ambiguous`` 随之变假，create_event 于是直接建。用户不必先答
+    ``confirm`` 再说一遍时间。
+    """
+    corrected = "2026-10-14T15:00:00+08:00"
+    llm = ScriptedLLM([SCHEDULE_PROFILE, SCHEDULE_DECISION, PARSE_TIME_AMBIGUOUS])
+    d = make_dispatcher(llm)
+    try:
+        rec = await d.submit(text_env("下周三下午三点开会", mode="async"))
+        await _drain(d, rec.task_id)
+        paused = await d.get(rec.task_id)
+
+        await d.clarify(paused.task_id, {
+            "question_id": paused.clarification["question_id"],
+            "edits": {"parse": {"iso": corrected, "ambiguous": False}},
+        })
+        await _drain(d, paused.task_id)
+        cur = await d.get(paused.task_id)
+
+        assert cur.status == "succeeded", cur.error
+        assert cur.artifacts["create"]["event"]["start"] == corrected
+        assert len(llm.calls) == 3, "改的是产出，不该重新解析"
+    finally:
+        await d.aclose()
+
+
+async def test_a_malformed_answer_is_a_typed_rejection_not_a_crash():
+    """答复形状不对（``edits`` 传成数组）→ 有类型的 ``invalid_request``，不是 500。
+
+    这是**请求**的问题，不是任务的问题：接不住的话它会以 pydantic 的
+    ValidationError 冒出去，在 HTTP 那一层变成一个 500——一个本该 422 的输入错误
+    被报成"服务端挂了"，排查方向直接被带偏。
+    """
+    from dispatcher.core.errors import DispatcherError
+
+    llm = ScriptedLLM([SCHEDULE_PROFILE, SCHEDULE_DECISION, PARSE_TIME_AMBIGUOUS])
+    d = make_dispatcher(llm)
+    try:
+        rec = await d.submit(text_env("下周三下午三点开会", mode="async"))
+        await _drain(d, rec.task_id)
+        paused = await d.get(rec.task_id)
+
+        with pytest.raises(DispatcherError) as ei:
+            await d.clarify(paused.task_id, {
+                "question_id": paused.clarification["question_id"],
+                "edits": ["parse", "iso"],   # 契约要求 object
+            })
+        assert ei.value.code == "invalid_request"
+        # 任务**不该**被这条坏输入弄成终态：它仍停在等人答复
+        assert (await d.get(paused.task_id)).status == "awaiting_clarification"
+    finally:
+        await d.aclose()
+
+
+async def test_a_non_committal_answer_fails_loudly_instead_of_re_asking():
+    """答复既不是 confirm 也不是 cancel（且没给 edits）→ **明确失败**，不重复问。
+
+    重复问同一个问题是这里最容易滑进去的坑：用户选"改一下时间"却没带新时间，
+    如果 handler 只是"再问一次"，他会拿到**一模一样的问题**，而那句修改被悄悄
+    丢掉了——静默失效。宁可失败并说清楚要带什么。
+    """
+    llm = ScriptedLLM([SCHEDULE_PROFILE, SCHEDULE_DECISION, PARSE_TIME_AMBIGUOUS])
+    d = make_dispatcher(llm)
+    try:
+        rec = await d.submit(text_env("下周三下午三点开会", mode="async"))
+        await _drain(d, rec.task_id)
+        paused = await d.get(rec.task_id)
+
+        await d.clarify(paused.task_id, {
+            "question_id": paused.clarification["question_id"], "answer_id": "edit",
+        })
+        await _drain(d, paused.task_id)
+        cur = await d.get(paused.task_id)
+
+        assert cur.status == "failed", cur.error
+        assert cur.node_runs["create"]["error"]["code"] == "clarification_not_actionable"
+        assert cur.clarification is None, "不该再问一遍同一个问题"
+    finally:
+        await d.aclose()
+
+
+
+# ---------------------------------------------------------------------------
 # 第三种执行路径：直答（path=direct_llm）
 # ---------------------------------------------------------------------------
 async def test_direct_llm_answers_without_any_handler():

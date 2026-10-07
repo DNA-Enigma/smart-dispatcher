@@ -80,6 +80,11 @@ nodes:
       # 也不为了标题好看而多插一个节点（那会带来新的失败面）。
       title: { $ref: "envelope.input.text" }
       start: { $ref: "parse.iso" }
+      # 下面这段就是 confirmation 段的接线：**一个工具看不到另一个工具的产出**，
+      # 所以"这次解析有没有歧义"必须作为数据依赖显式绑进来，create_event 才判得了。
+      # 少了这一行，确认段就只是一段散文——下面 confirmation 段声明的条件永远
+      # 不会被求值，日程会拿一个猜出来的时间直接被建出来（这正是 P1-e 的现场）。
+      ambiguous: { $ref: "parse.ambiguous" }
     timeout_ms: 5000
     idempotent: true                # 调度层注入稳定的 idempotency_token，重试不会重复建
     on_failure: fail_task
@@ -97,10 +102,17 @@ max_parallelism: 1
 # 时间解析有歧义时（parse.ambiguous 为真）**停下来问**，而不是拿一个猜的绝对时间
 # 直接建日程——建错的日程用户往往到点才发现。
 #
-# 与 receipt_to_entry 的 confirmation 段同构：它描述的是"这一步之前应当有一次
-# 人工确认"，真正的确认动作由该步的 handler 工具返回 ToolResult.confirm 触发
-# （见 handlers/bookkeeping/handler.py 里 build_ledger_entry 的用法）。
-# 答复后任务从断点继续，已完成节点的产出保留。
+# 与 receipt_to_entry 的 confirmation 段同构：它描述"这一步之前应当有一次人工确认"，
+# 而起作用的是**两处接线**，都不在这段声明里：
+#   1. create 节点的 inputs 把 parse.ambiguous 绑了进来（工具看不到别的工具的产出）；
+#   2. create_event 在该字段为真时返回 ToolResult.confirm。
+# 这段里的 on_condition / options 是同一件事的**可读表述**，供人读与 04 归因；
+# 真正改变行为的判定在 handler 里（领域规则归领域）。
+#
+# 答复的处置（见 core/execution.py 的 ClarificationAnswer）：
+#   confirm → 继续建；cancel → 由调度层把任务置为 cancelled，**不建**；
+#   其它答复 → create_event 明确失败，不重复问同一个问题，也不拿旧时间去建。
+# 想改时间时由客户端把新的解析结果放进 clarify 的 edits（会覆盖 parse 的产出）。
 # -----------------------------------------------------------------------------
 confirmation:
   insert_before: create
@@ -108,7 +120,6 @@ confirmation:
   question_template: "我把时间理解成 {iso}，对吗？"
   options:
     - { id: confirm, label: 对，就这么建 }
-    - { id: edit, label: 改一下时间 }
     - { id: cancel, label: 不用建了 }
   blocking: true
   # 超时未答复按 blocking=false 处理：任务停在 awaiting_clarification，

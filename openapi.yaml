@@ -250,12 +250,31 @@ paths:
               additionalProperties: false
               properties:
                 question_id: { type: string }
-                answer_id: { type: [string, "null"], description: 选项 id。自由文本回答时可为空。 }
-                free_text: { type: [string, "null"] }
+                answer_id:
+                  type: [string, "null"]
+                  description: |
+                    选项 id。自由文本回答时可为空。
+                    **保留 id `cancel`**：表示「别做了」。它由调度层处理——任务直接
+                    置为 cancelled，**暂停的那一步不再执行**（所以每个领域不必各自
+                    实现一遍「取消」，模板里"cancel → 不执行写入"这句话靠的就是它）。
+                    其余 id 由提问的那个工具自己解释，客户端须原样回传 id，
+                    不要用 label 代替：label 是给人看的文案，改一个字不该改变行为。
+                free_text:
+                  type: [string, "null"]
+                  description: >
+                    自由文本回答。**只有它会被并进用户原话**继续参与执行——
+                    选项（answer_id）是一个"决定"，不是新内容，它经 ctx.clarification
+                    直接送达提问的那个工具，不会污染请求文本（否则绑着原话的字段会被
+                    改写，例如日程标题会变成"下周三下午三点开会（用户澄清：对，就这么建）"）。
                 edits:
                   type: [object, "null"]
                   additionalProperties: true
-                  description: 用户对已抽取字段的修改。会记录为 human_signal.edits，是 04 最有价值的信号。
+                  description: |
+                    用户对已抽取字段的修改。**按节点 id 覆盖上游产出**，例如
+                    {"parse": {"iso": "2026-10-14T15:00:00+08:00", "ambiguous": false}}
+                    改的是"那一步算出来的东西"，因此它同时是"改一下"这条路的实现方式：
+                    覆盖之后下游重新执行时看到的就是修正值，不必再问一次。
+                    会记录为 human_signal.edits，是 04 最有价值的信号。
       responses:
         "200":
           description: 已受理，任务恢复执行

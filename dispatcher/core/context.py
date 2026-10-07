@@ -28,6 +28,7 @@ from .cancel import CancellationToken
 from .errors import DispatcherError
 from .eventbus import EventBus
 from .events import EventRecord
+from .execution import ClarificationAnswer
 from .policy import Policy
 from .pricing import Pricing
 
@@ -96,6 +97,15 @@ class DispatchContext:
     # 放在这里而不是让每个 handler 自己传：**"节点执行要不要开深度思考"是策略问题，
     # 不是 handler 问题**。让 handler 各自记得传，就等于制造了一堆会忘记的地方。
     _node_options: dict[str, Any] = field(repr=False, default_factory=dict)
+
+    # 上一次 `ToolResult.confirm` 的答复（**只在从澄清恢复的那一次执行上有值**）。
+    #
+    # 与上面 "-- 能力 --" 一节同类，是 handler 可见的输入；位置排在最后只是因为
+    # dataclass 要求有默认值的字段不能排在无默认值的字段之前。
+    #
+    # 少了它，`ToolResult.confirm` 就是**单程**的：任务停下来问了用户，答复却永远
+    # 到不了提问的那一步，handler 只能凭本地状态猜"用户大概是同意了吧"。
+    clarification: ClarificationAnswer | None = field(default=None, repr=False)
     logger: logging.Logger = field(
         repr=False, default_factory=lambda: logging.getLogger("dispatcher.handler")
     )
