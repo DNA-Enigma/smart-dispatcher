@@ -10,23 +10,42 @@
 * 「交通银行花了多少」→ ``merchant`` 含「交通银行」、``category`` **不是**「交通」
   （中文无词边界，本地关键词表会把「交通银行」里的「交通」认成分类）；
 * 方向判不出 → **没有** ``direction`` 键，而不是默认成 ``expense``；
-* 产出能被消费端 ``toQuery()`` 的规则接受。
+* 产出能被消费端 ``toQuery()`` 的规则接受；
+* 相对时间（这个月 / 上个月）按**注入的「今天」**换算，且按中国标准时间算，
+  不按服务端机器的时区算。
 """
 
 from __future__ import annotations
 
+import calendar
+import json
 import re
-
-import pytest
+from collections.abc import Callable
+from datetime import UTC, date, datetime, timedelta
+from typing import Any
 
 from dispatcher.core.registry import HandlerManifest
+from dispatcher.ports.llm import LLMResult
 from handlers.bookkeeping.handler import BookkeepingHandler, _sanitize_ledger_query
-from tests.fakes import ScriptedLLM
+from tests.fakes import RecordedCall, ScriptedLLM
 
 # 与 tests/test_integration.py 的 _ctx_for 同一套构造，避免跨文件依赖私有辅助。
 ISO_DAY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 CLIENT_DIRECTIONS = {"expense", "income", "both"}
 CLIENT_GROUP_BY = {"none", "category", "merchant", "month"}
+# 判定提示词里注入「今天」的那一行。替身照它算相对区间，于是注入丢了就会红。
+TODAY_IN_PROMPT = re.compile(r"今天是 (\d{4}-\d{2}-\d{2})")
+
+
+def _frozen_clock(y: int, m: int, d: int, *, hour: int = 12) -> Callable[[], datetime]:
+    """把 ctx 的时钟钉在某个 UTC 时刻（默认当天中午）。
+
+    取中午是因为它离前后两个日界都远：时区换算一旦没接对就会明显差一天，
+    而不是只在某个小时里偶发。这是个 **UTC** 时刻——按中国时间解释它属于哪一天，
+    是被测代码的责任。
+    """
+    fixed = datetime(y, m, d, hour, 0, tzinfo=UTC)
+    return lambda: fixed
 
 
 def _manifest() -> HandlerManifest:
@@ -38,7 +57,9 @@ def _manifest() -> HandlerManifest:
     })
 
 
-def _ctx_for(llm, *, config=None):
+def _ctx_for(llm, *, config=None, clock=None):
+    from dispatcher.adapters.memory_media import InMemoryMediaStore
+    from dispatcher.adapters.memory_state import InMemoryStateStore
     from dispatcher.core.budget import BudgetHandle, BudgetLedger
     from dispatcher.core.cancel import CancellationToken
     from dispatcher.core.context import DispatchContext, MediaResolver
@@ -46,8 +67,6 @@ def _ctx_for(llm, *, config=None):
     from dispatcher.core.policy import load_policy
     from dispatcher.core.pricing import load_pricing
     from dispatcher.core.settings import REPO_ROOT, get_settings
-    from dispatcher.adapters.memory_media import InMemoryMediaStore
-    from dispatcher.adapters.memory_state import InMemoryStateStore
 
     s = get_settings()
     policy = load_policy(s.policy_path)
@@ -64,6 +83,7 @@ def _ctx_for(llm, *, config=None):
         cancellation=CancellationToken(), events=EventBus(st),
         _policy=policy, _pricing=pricing, _llm=llm,
         _allowed_tiers=list(policy.model_tier_ids),
+        clock=clock,
     )
 
 
@@ -91,6 +111,56 @@ def assert_client_accepts(spec: dict) -> None:
     for key in ("category", "merchant"):
         if key in spec:
             assert isinstance(spec[key], str) and spec[key].strip(), f"{key} 是空白串"
+
+
+# ---------------------------------------------------------------------------
+# 相对时间：模型那一步的替身与区间算法
+# ---------------------------------------------------------------------------
+def _this_month(today: date) -> tuple[date, date]:
+    return date(today.year, today.month, 1), date(
+        today.year, today.month, calendar.monthrange(today.year, today.month)[1]
+    )
+
+
+def _last_month(today: date) -> tuple[date, date]:
+    return _this_month(date(today.year, today.month, 1) - timedelta(days=1))
+
+
+class RelativeDateLLM(ScriptedLLM):
+    """照提示词里注入的「今天」算相对区间的模型替身。
+
+    「这个月」→ 具体日期这一步在提示词里是交给模型的，测试里请不到真模型。
+    替身把那**一步照着做出来**：从提示词里读出「今天是哪天」，再按传入的算法
+    算区间。于是「这个月 → 2026-10-01 ~ 10-31」这条断言是被**注入的日期**
+    推出来的——把日期注入删掉，替身读不到今天，用例立刻红。
+
+    反过来，如果只是把 ``ScriptedLLM`` 的返回写死成 ``10-01 ~ 10-31``，
+    断言就变成在检查测试自己写的常量，什么也证明不了。
+    """
+
+    def __init__(self, resolve: Callable[[date], tuple[date, date]], **extra: Any) -> None:
+        super().__init__([])
+        self._resolve = resolve
+        self._extra = extra
+
+    async def generate_json(self, messages, **kw):  # type: ignore[override]
+        self.calls.append(
+            RecordedCall(
+                messages=list(messages), tier=kw.get("tier", ""),
+                requires=tuple(kw.get("requires") or ()), temperature=None,
+                options={}, json_mode=True, timeout_ms=kw.get("timeout_ms"),
+            )
+        )
+        prompt = "\n".join(m.content for m in messages if isinstance(m.content, str))
+        found = TODAY_IN_PROMPT.search(prompt)
+        assert found, f"判定提示词里没有注入「今天」，模型无从换算相对时间：{prompt[:200]!r}"
+        start, end = self._resolve(date.fromisoformat(found.group(1)))
+        payload = {**self._extra, "from": start.isoformat(), "to": end.isoformat()}
+        return payload, LLMResult(
+            text=json.dumps(payload, ensure_ascii=False), tier=kw.get("tier", ""),
+            model_resolved="test:relative-date", latency_ms=1,
+            input_tokens=1, output_tokens=1, finish_reason="stop",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +221,96 @@ async def test_category_vocabulary_is_injected_into_the_judgment_prompt():
     prompt = llm.calls[0].user_text
     assert "吃饭" in prompt and "打车" in prompt, "用户自己的词表要注入提示词"
     assert "交通银行" in prompt, "用户原话要给到判定"
+
+
+# ---------------------------------------------------------------------------
+# 相对时间：今天的日期必须进提示词，相对区间由它推出
+# ---------------------------------------------------------------------------
+async def test_judgment_prompt_carries_today_and_its_weekday():
+    """把「今天」钉成 2026-10-07（星期三），提示词里必须出现这一天。"""
+    llm = ScriptedLLM([{"direction": "expense"}])
+    h = BookkeepingHandler(_manifest())
+    await h.tool_query_ledger(
+        {"question": "这个月花了多少"}, _ctx_for(llm, clock=_frozen_clock(2026, 10, 7))
+    )
+    assert len(llm.calls) == 1
+    prompt = llm.calls[0].user_text
+    assert "2026-10-07" in prompt, f"提示词里没有今天的日期，模型只能瞎猜年月：{prompt}"
+    assert "星期三" in prompt, "带星期才够模型处理「上周三」这类说法"
+    assert "UTC+8" in prompt, "时区要写明白，否则模型可能按 UTC 的日界算"
+
+
+async def test_today_follows_china_time_not_the_machine_utc_day():
+    """注入的是一个 UTC 时刻；「今天」必须按中国时间取，而不是它的 UTC 日期。
+
+    2026-10-07 17:00 UTC 已经是北京时间 2026-10-08 01:00。老老实实取
+    ``.date()`` 会得到 10-07 —— 服务端跑在 UTC 容器里时，每天 00:00~08:00
+    之间的问句都会答错一天，而且不报错。
+    """
+    llm = ScriptedLLM([{"direction": "expense"}])
+    h = BookkeepingHandler(_manifest())
+    await h.tool_query_ledger(
+        {"question": "今天花了多少"}, _ctx_for(llm, clock=_frozen_clock(2026, 10, 7, hour=17))
+    )
+    prompt = llm.calls[0].user_text
+    assert "2026-10-08" in prompt, f"应按中国时间取到今天=10-08：{prompt}"
+    assert "2026-10-07" not in prompt, "UTC 日期泄漏进提示词了，时区没换"
+
+
+async def test_this_month_range_is_derived_from_the_injected_today():
+    """今天 2026-10-07，问「这个月餐饮花了多少」→ 2026-10-01 ~ 2026-10-31。
+
+    10 月有 31 天：末日断言成 31 而不是 30，才挡得住「按月长 30 算」这类错。
+    """
+    llm = RelativeDateLLM(_this_month, direction="expense", category="餐饮")
+    h = BookkeepingHandler(_manifest())
+    res = await h.tool_query_ledger(
+        {"question": "这个月餐饮花了多少"},
+        _ctx_for(
+            llm,
+            clock=_frozen_clock(2026, 10, 7),
+            config={"categories": ["餐饮", "交通", "居住", "其他"]},
+        ),
+    )
+    assert res.ok, res.failure
+    spec = res.output
+    assert_client_accepts(spec)
+    assert spec["from"] == "2026-10-01", spec
+    assert spec["to"] == "2026-10-31", spec
+    assert spec["category"] == "餐饮" and spec["direction"] == "expense", spec
+
+
+async def test_last_month_range_crosses_the_month_boundary():
+    """今天 2026-11-02，问「上个月花了多少」→ 2026-10-01 ~ 2026-10-31。
+
+    月初问「上个月」是这类换算最容易错的地方：想成「本月往前挪一格」就会
+    丢掉 10 月多出来的那 31 日，或者算出 11-01 这种越界日期。
+    """
+    llm = RelativeDateLLM(_last_month, direction="expense")
+    h = BookkeepingHandler(_manifest())
+    res = await h.tool_query_ledger(
+        {"question": "上个月花了多少"}, _ctx_for(llm, clock=_frozen_clock(2026, 11, 2))
+    )
+    assert res.ok, res.failure
+    spec = res.output
+    assert_client_accepts(spec)
+    assert spec["from"] == "2026-10-01", spec
+    assert spec["to"] == "2026-10-31", spec
+
+
+async def test_year_end_this_month_does_not_roll_into_next_year():
+    """今天 2026-12-31，问「这个月」→ 2026-12-01 ~ 2026-12-31，不许跨到 2027。"""
+    llm = RelativeDateLLM(_this_month, direction="expense")
+    h = BookkeepingHandler(_manifest())
+    res = await h.tool_query_ledger(
+        {"question": "这个月花了多少"}, _ctx_for(llm, clock=_frozen_clock(2026, 12, 31))
+    )
+    assert res.ok, res.failure
+    spec = res.output
+    assert_client_accepts(spec)
+    assert spec["from"] == "2026-12-01", spec
+    assert spec["to"] == "2026-12-31", spec
+    assert not spec["to"].startswith("2027"), f"年末把月份算到明年了：{spec}"
 
 
 # ---------------------------------------------------------------------------
@@ -244,18 +404,18 @@ async def test_empty_input_produces_an_empty_spec_not_a_fake_query():
 # 端到端：single_tool_action 下产出挂 artifacts.main
 # ---------------------------------------------------------------------------
 async def test_end_to_end_single_tool_action_mounts_spec_at_artifacts_main():
-    from dispatcher.core.agents import load_agents
-    from dispatcher.core.eventbus import EventBus
-    from dispatcher.core.taxonomy import load_taxonomy
-    from dispatcher.pipeline import Dispatcher
-    from dispatcher.core.budget import BudgetLedger
-    from dispatcher.core.contract import TaskEnvelope
-    from dispatcher.core.settings import REPO_ROOT, get_settings
     from dispatcher.adapters.memory_media import InMemoryMediaStore
     from dispatcher.adapters.memory_state import InMemoryStateStore
+    from dispatcher.core.agents import load_agents
+    from dispatcher.core.budget import BudgetLedger
+    from dispatcher.core.contract import TaskEnvelope
+    from dispatcher.core.eventbus import EventBus
     from dispatcher.core.policy import load_policy
     from dispatcher.core.pricing import load_pricing
     from dispatcher.core.prompts import PromptLibrary
+    from dispatcher.core.settings import REPO_ROOT, get_settings
+    from dispatcher.core.taxonomy import load_taxonomy
+    from dispatcher.pipeline import Dispatcher
     from dispatcher.plugins import build_registry
 
     profile = {

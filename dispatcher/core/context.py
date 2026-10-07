@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import base64
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -98,6 +99,14 @@ class DispatchContext:
     # 不是 handler 问题**。让 handler 各自记得传，就等于制造了一堆会忘记的地方。
     _node_options: dict[str, Any] = field(repr=False, default_factory=dict)
 
+    # 「现在几点」的注入点：默认是真实 UTC 时钟，测试注入一个返回固定时刻的
+    # callable 就能把「今天」钉死。没有它，凡是按当天换算相对时间的 handler
+    # （问账的「这个月」、日程的「下周三」）在测试里都只能依赖运行当天——
+    # 用例今天绿、明天可能红，而且断言没法写具体日期。
+    clock: Callable[[], datetime] | None = field(
+        default=None, repr=False, compare=False
+    )
+
     # 上一次 `ToolResult.confirm` 的答复（**只在从澄清恢复的那一次执行上有值**）。
     #
     # 与上面 "-- 能力 --" 一节同类，是 handler 可见的输入；位置排在最后只是因为
@@ -121,7 +130,12 @@ class DispatchContext:
         return f"{self.task_id}:{self.subtask_id}"
 
     def now(self) -> datetime:
-        return datetime.now(UTC)
+        """当前时刻（带时区）。默认取真实 UTC 时钟；测试可注入 ``clock`` 固定它。
+
+        返回的是**时刻**（UTC），不是某个时区的墙上时间——按哪个时区解释由调用方
+        决定。领域里的「今天」要显式换到用户时区再取日期，别直接 ``.date()``。
+        """
+        return self.clock() if self.clock is not None else datetime.now(UTC)
 
     # -- 模型访问 ------------------------------------------------------
     def resolve_tier(self, requires: tuple[str, ...] | list[str]) -> str | None:

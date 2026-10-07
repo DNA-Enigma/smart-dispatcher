@@ -300,7 +300,20 @@ direct_llm:
   # options 关掉深度思考，理由与 01/02/03 三段一样（P0-2 的实测教训）：
   # 供应商的深度思考默认开启并强制覆盖 temperature，reasoning token 还按输出计费。
   # 直答要的是"一次说清楚"，不是推理链。
-  timeout_ms: 8000
+  #
+  # 8000 → 30000（2026-10-07 实测后改）：**8 秒是拍脑袋填的，实际不够。**
+  # 用真实的 `prompts/direct_answer.md` + 月度小结那类 prompt 连测 10 次
+  # （模型 mimo-v2.6-flash、thinking=disabled 实测生效 reasoning_tokens=0）：
+  #   短问句 3.6s / 4.2s；带数据围栏的真实小结 prompt：
+  #   7.0 / 7.4 / 9.2 / 11.2 / 16.7 / 18.2 / 19.9 s
+  # 即**真实场景下绝大多数请求都超过 8 秒**，于是「超时 → 降级本地模板」
+  # 成了常态而不是兜底，AI 小结几乎永远是模板拼的。
+  # 客户端早就给了 30 秒（`AiSummary.TIMEOUT_MS = 30_000` + 轮询 + 骨架屏），
+  # 瓶颈只在这一行。对齐到 30000，与客户端同界。
+  #
+  # 没有动 `limits.sync_timeout_ms`：那条是「投影延迟超预算就转异步」的
+  # 触发线，让慢请求走异步轮询是设计意图，不是这里的故障。
+  timeout_ms: 30000
   requires: [text]
   options:
     thinking: { type: disabled }

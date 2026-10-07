@@ -14,6 +14,7 @@ import json
 from datetime import date
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from dispatcher.core.execution import ToolResult
 from dispatcher.ports.llm import LLMMessage
@@ -40,6 +41,25 @@ def _load_default_categories() -> list[str]:
 
 
 FALLBACK_CATEGORIES = _load_default_categories()
+
+
+# 「今天」按**中国标准时间**算，不按服务端机器的时区算。
+# 服务端可能跑在 UTC 容器里：北京时间 10-08 00:30 时 UTC 还是 10-07，
+# `date.today()` 会答前一天——问「今天花了多少」直接错，月初问「这个月」
+# 整个区间偏一格。时区算错不会报错，只是把另一天的账当成今天的答案，
+# 而这正是最难被发现的一类错。固定 Asia/Shanghai 与消费端「本机时间」同口径，
+# 也与 handlers/calendar 的既有做法一致。
+#
+# 为什么不用 envelope.identity.timezone：它目前只进了画像提示词，没有接到
+# DispatchContext 上，这里拿不到。真要按用户时区走，得先把时区从 envelope
+# 一路传到 ctx——那是另一处改动，不在本次修复的范围里。
+_TZ = ZoneInfo("Asia/Shanghai")
+_WEEKDAY_CN = "一二三四五六日"
+
+
+def _today(ctx: Any) -> date:
+    """ctx 上的时钟（可注入，见 ``DispatchContext.clock``）→ 中国标准时间下的今天。"""
+    return ctx.now().astimezone(_TZ).date()
 
 
 def _iso_day(value: Any) -> str | None:
@@ -349,8 +369,16 @@ class BookkeepingHandler(HandlerBase):
         self, question: str, draft: dict, categories: list[str], ctx: Any
     ) -> dict:
         """问句 → 查询结构。词表注入提示词，主判定交给模型。"""
+        # 相对时间必须先给模型一个锚点。以前这里让它「把『这个月』换算成具体
+        # 日期」却不告诉它今天是几号，模型只能瞎猜年月（实测产出 2025-11、
+        # 2024-11），而日期错不会报错——客户端拿着错的区间去本机 SQL 聚合，
+        # 只是数字不对。
+        today = _today(ctx)
         prompt = (
             "把用户的问题翻译成一份账目查询结构。只输出一个 JSON 对象。\n"
+            f"今天是 {today.isoformat()}（星期{_WEEKDAY_CN[today.weekday()]}，"
+            "中国标准时间 UTC+8）。所有相对时间（今天/本周/本月/上个月/"
+            "最近三个月）都以这一天为准换算，日期用 yyyy-MM-dd。\n"
             f"用户原话：{question or '（未提供原话）'}\n"
             f"初步草稿（可能有错，以用户原话为准）：{json.dumps(draft, ensure_ascii=False)}\n"
             f"该用户的分类词表（category 只能取自这里，精确匹配）：{categories}\n"
