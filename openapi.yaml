@@ -247,7 +247,10 @@ paths:
             schema:
               type: object
               required: [question_id]
-              additionalProperties: false
+              description: >
+                未列出的字段**忽略但不拒绝**（向前兼容）：客户端可以先发、服务端后支持。
+                缺必填或类型不符返回 400 `invalid_request`，响应体是 Problem。
+              additionalProperties: true
               properties:
                 question_id: { type: string }
                 answer_id:
@@ -317,7 +320,10 @@ paths:
             schema:
               type: object
               required: [verdict]
-              additionalProperties: false
+              description: >
+                未列出的字段**忽略但不拒绝**（向前兼容）：客户端可以先发、服务端后支持。
+                缺必填或类型不符返回 400 `invalid_request`，响应体是 Problem。
+              additionalProperties: true
               properties:
                 verdict: { type: string, enum: [accepted, edited, rejected, ignored] }
                 edits:

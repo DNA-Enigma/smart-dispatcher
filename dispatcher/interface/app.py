@@ -25,8 +25,11 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from ..core.contract import TaskEnvelope, wire_dump
 from ..core.errors import DispatcherError
 from ..core.events import TERMINAL_EVENTS, to_sse, to_sse_heartbeat
+from ..core.execution import ClarificationAnswer
+from ..core.runlog import HumanSignal
 from ..core.state import TERMINAL_STATUSES
 from ..pipeline import Dispatcher, describe_config
+from .validation import read_body
 
 log = logging.getLogger("dispatcher")
 
@@ -260,7 +263,10 @@ def create_app() -> FastAPI:
 
     @app.post("/v1/tasks/{task_id}/clarify")
     async def clarify(task_id: str, request: Request) -> dict[str, Any]:
-        body = await request.json()
+        body = await read_body(
+            request, ClarificationAnswer,
+            required=("question_id",), endpoint="POST /v1/tasks/{task_id}/clarify",
+        )
         record = await get_dispatcher().clarify(task_id, body)
         return record.to_snapshot()
 
@@ -270,12 +276,14 @@ def create_app() -> FastAPI:
         确认/修改页：用户把分类从"其他"改成"餐饮"，那一下同时给出了错在哪和对的是什么。
         没有它，04 只能靠延迟与成本反推质量，效果差一个量级。
         """
-        d = get_dispatcher()
-        body = await request.json()
-        try:
-            signal = await d.record_feedback(task_id, body)
-        except Exception as e:
-            raise DispatcherError("invalid_request", f"反馈格式不符：{e}") from e
+        body = await read_body(
+            request, HumanSignal,
+            required=("verdict",), endpoint="POST /v1/tasks/{task_id}/feedback",
+        )
+        # 不再用 ``except Exception`` 兜底转 400：请求形状已在校验层挡下，此处剩下的
+        # 都是真实结果——任务不存在是 **404**，不是"反馈格式不符"。此前那把兜底伞把
+        # 404 也压成了 400，与 openapi.yaml 为 feedback 声明的响应矛盾。
+        signal = await get_dispatcher().record_feedback(task_id, body)
         return {"task_id": task_id, "human_signal": signal}
 
     @app.post("/v1/tasks/{task_id}/cancel")

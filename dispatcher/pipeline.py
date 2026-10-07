@@ -763,8 +763,9 @@ class Dispatcher:
             )
         except ValidationError as e:
             # 形状不对（``edits`` 传成数组之类）是**请求**的问题，不是任务的问题。
-            # 不接住的话这里会是一个 500——一个本该 422 的输入错误被报成"服务端挂了"，
-            # 排查方向直接被带偏。（端点上还缺一层完整的请求校验，见 HANDOFF 第 8 节的 P1-4b。）
+            # 不接住的话这里会是一个 500——一个本该 400 的输入错误被报成"服务端挂了"，
+            # 排查方向直接被带偏。端点上现在也有一层校验（``interface/validation.py``），
+            # 这里是第二道：直接调 ``clarify`` 的调用方（测试、内嵌用法）绕过端点时仍要兜住。
             raise DispatcherError(
                 "invalid_request",
                 f"澄清答复不符合契约：{e.errors()}",
