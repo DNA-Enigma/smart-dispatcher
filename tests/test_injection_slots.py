@@ -669,6 +669,71 @@ async def test_merchant_cache_key_carries_the_category_vocabulary():
     assert len(llm.calls) == 2
 
 
+async def test_merchant_cache_slot_count_is_bounded_and_evicts_the_coldest():
+    """槽位（租户 × 词表）个数有上界，淘汰最久未用的那个。
+
+    上一版只做了租户隔离、没做上界：每个新租户、每次用户改分类都开一张新表，
+    旧表谁也不回收——按租户分槽在**内存上**是无界的。
+
+    反例：去掉 ``_merchant_cache`` 里的槽位淘汰 → 65 个租户就留下 65 张表 → 红。
+    反向锚：刚用过的租户必须还在（淘汰的是最冷的，不是"一律清空"）。
+    """
+    from handlers.bookkeeping.handler import _MAX_MERCHANT_CACHE_SLOTS
+
+    n = _MAX_MERCHANT_CACHE_SLOTS + 1
+    h = BookkeepingHandler(_manifest())
+    llm = ScriptedLLM([
+        {"suggestions": [{"merchant": f"店{i}", "category": "餐饮"}]} for i in range(n)
+    ])
+    last_ctx = None
+    for i in range(n):
+        last_ctx = _ctx(llm, tenant=f"t{i:03d}", config={"categories": ["餐饮", "其他"]})
+        res = await h.tool_categorize_merchants({"merchants": [f"店{i}"]}, last_ctx)
+        assert res.ok, res.failure
+
+    assert len(h._merchants) <= _MAX_MERCHANT_CACHE_SLOTS, (
+        f"槽位数 {len(h._merchants)} 超过上界 {_MAX_MERCHANT_CACHE_SLOTS}——缓存随租户数无界增长"
+    )
+    # 最后那个租户的表还在：淘汰的是最冷的，不是"把表清空"
+    assert (await h.tool_lookup_merchant({"name": f"店{n - 1}"}, last_ctx)).output[
+        "category"
+    ] == "餐饮"
+    assert len(llm.calls) == n, "查表不该产生模型调用"
+
+
+async def test_batch_categorization_returns_every_merchant_even_when_the_cache_overflows():
+    """一次批量大于缓存上界时，产出里**一个商户都不能少**。
+
+    这条钉的是一个"加了上界就会踩到"的坑：``tool_categorize_merchants`` 以前是
+    从缓存里拼产出的，于是 LRU 一挤，先写进去的那几条建议就**静默消失**——
+    调用方要的是这一批每个商户都有归类，少一条它看不出来，只会照常入账。
+    产出改为从本次解析结果拼之后，缓存退化成纯粹的加速器。
+
+    反例：把产出改回 ``[{"merchant": n, "category": cache[n]} ...]`` → 红
+    （1026 条只回来 1024 条），且缓存上界那条断言也一起红。
+    """
+    from handlers.bookkeeping.handler import _MAX_MERCHANTS_PER_SLOT
+
+    names = [f"商户{i:05d}" for i in range(_MAX_MERCHANTS_PER_SLOT + 2)]
+    h = BookkeepingHandler(_manifest())
+    llm = ScriptedLLM([
+        {"suggestions": [{"merchant": n, "category": "餐饮"} for n in names]},
+    ])
+    ctx = _ctx(llm, tenant="t1", config={"categories": ["餐饮", "其他"]})
+    res = await h.tool_categorize_merchants({"merchants": names}, ctx)
+    assert res.ok, res.failure
+
+    got = [s["merchant"] for s in res.output["suggestions"]]
+    assert len(got) == len(names), (
+        f"这一批 {len(names)} 个商户只回来 {len(got)} 条——被缓存淘汰吃掉的是产出"
+    )
+    assert got[0] == names[0], "第一条（最先写入、最先被挤掉的那条）不能缺"
+    assert len(llm.calls) == 1, "一批名单一次调用，不该按条数重复问模型"
+    # 上界本身也要成立（读的是模块常量，所以调低上界不会让这条失真）
+    cache = h._merchant_cache(ctx, ["餐饮", "其他"])
+    assert len(cache) <= _MAX_MERCHANTS_PER_SLOT
+
+
 async def test_merchant_cache_still_hits_within_the_same_tenant_and_vocabulary():
     """分槽不是"把缓存关掉"：同租户同词表下，第二次仍然不问模型。
 

@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+from collections import OrderedDict
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -56,6 +57,50 @@ FALLBACK_CATEGORIES = _load_default_categories()
 # 一路传到 ctx——那是另一处改动，不在本次修复的范围里。
 _TZ = ZoneInfo("Asia/Shanghai")
 _WEEKDAY_CN = "一二三四五六日"
+
+
+# -- 商户缓存的上界 --------------------------------------------------------
+# handler 实例由调度层 build 一次、跨任务复用，所以 ``self._merchants`` 的生命周期
+# 等于进程。两道维度都会长：租户 × 分类词表的组合数随用户数涨，每张表里的商户名
+# 随流水条数涨。**两个上限都要有**——只限槽位数，一个租户一张表照样能涨到无限。
+#
+# 这两个数不是"调出来的最优值"，是**显式选定的内存上限**，依据是下面的字节算术；
+# 要改它只需要问内存预算，不需要跑基准。命中率随上限收紧只会多问几次模型，
+# **不会丢东西**（被挤掉的商户名下次再问一次就有了）——唯一要小心的例外见
+# ``tool_categorize_merchants``：那里的产出曾经是从缓存里拼出来的，上限一加就会
+# 悄悄少几条，所以那条路径改成从**本次解析结果**拼。
+#
+#   槽键：tenant_id（~40B）+ 分类词表（~20 词 × 12B ≈ 240B）→ 约 300B/槽
+#   条目：商户名 + 分类名 + 字典开销 → 约 150B/条
+#   最坏：64 槽 × 1024 条 × 150B ≈ 10MB
+_MAX_MERCHANT_CACHE_SLOTS = 64
+_MAX_MERCHANTS_PER_SLOT = 1024
+
+
+class _MerchantCache(OrderedDict):
+    """有上界的商户表：写入超过上限时淘汰**最久未用到**的那条。
+
+    用 ``OrderedDict`` 而不是裸 ``dict`` 是因为要做 LRU（命中与写入都算"用过"）。
+    选 LRU 而不是"满了就不再写入"：后者会让一张表在达到上限后**冻住**，
+    新增的商户永远进不来，而新增的往往正是当下的热点；LRU 淘汰的是最冷的那个。
+    """
+
+    def __init__(self, maxsize: int = _MAX_MERCHANTS_PER_SLOT) -> None:
+        super().__init__()
+        self._maxsize = maxsize
+
+    def get(self, key: Any, default: Any = None) -> Any:
+        if key in self:
+            self.move_to_end(key)
+        return super().get(key, default)
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        if key in self:
+            self.move_to_end(key)
+        super().__setitem__(key, value)
+        while len(self) > self._maxsize:
+            # ``last=False`` = 弹出最早插入/最早被用到的那条（OrderedDict 的头部）
+            super().popitem(last=False)
 
 
 def _today(ctx: Any) -> date:
@@ -154,10 +199,10 @@ class BookkeepingHandler(HandlerBase):
         super().__init__(manifest)
         self._ledger: LedgerPort = ledger or InMemoryLedger()
         # 商户分类表不是一张进程级的全局字典，而是按 **(租户, 分类词表)** 分槽的
-        # 一组字典。理由见 ``_merchant_cache``。
-        self._merchants: dict[tuple[str, tuple[str, ...]], dict[str, str]] = {}
+        # 一组字典，且两头都有上界。理由见 ``_merchant_cache``。
+        self._merchants: OrderedDict[tuple[str, tuple[str, ...]], _MerchantCache] = OrderedDict()
 
-    def _merchant_cache(self, ctx: Any, categories: list[str]) -> dict[str, str]:
+    def _merchant_cache(self, ctx: Any, categories: list[str]) -> _MerchantCache:
         """取**本租户、本词表**下的商户表。
 
         **为什么不能是一张全局表**：handler 实例由调度层 build 一次、跨任务复用，
@@ -175,9 +220,22 @@ class BookkeepingHandler(HandlerBase):
 
         代价是命中率随 (租户 × 词表) 的个数摊薄。这条不该跟"少问几次模型"做交换：
         省下的是一次归类调用，赔掉的是租户隔离。
+
+        **槽位本身也有上界**（``_MAX_MERCHANT_CACHE_SLOTS``，LRU）：上一个版本只做了
+        隔离，没做上界，于是"按租户分槽"在**内存上**是无界的——每个新租户、每次用户
+        改分类都开一张新表，旧表谁也不回收。被淘汰的槽下次命中不到，代价是一次归类
+        调用，与租户隔离无关（隔离靠的是**键里带租户**，不是"表一直在"）。
         """
         key = (ctx.tenant_id or "default", tuple(categories))
-        return self._merchants.setdefault(key, {})
+        slot = self._merchants.get(key)
+        if slot is None:
+            slot = _MerchantCache()
+            self._merchants[key] = slot
+            while len(self._merchants) > _MAX_MERCHANT_CACHE_SLOTS:
+                self._merchants.popitem(last=False)
+        else:
+            self._merchants.move_to_end(key)
+        return slot
 
     def _categories(self, ctx) -> list[str]:
         """分类词表从**用户配置**来，不是代码里的常量。
@@ -303,6 +361,11 @@ class BookkeepingHandler(HandlerBase):
         # 词表是用户的（ctx.config.categories）。"其他"是随附兜底词表里的那个，
         # 用户自己的词表里没有它就退回最后一个，而不是硬塞一个它不认识的分类。
         fallback = "其他" if "其他" in categories else categories[-1]
+        # 本次解析出来的结果单独留一份。**产出不能从缓存里拼**：缓存的上界一旦
+        # 小于一次批量的大小，先写进去的条目会被 LRU 挤掉，而"挤掉"在这里意味着
+        # 那几条建议从产出里**静默消失**——调用方要的是这一批每一个商户都有归类，
+        # 少一条它看不出来，只会照常入账。缓存是加速器，不该兼任装配台。
+        fresh: dict[str, str] = {}
         unknown = [n for n in dict.fromkeys(names) if n not in cache]
         if unknown:
             listing = "\n".join(f"- {n}" for n in unknown)
@@ -338,11 +401,12 @@ class BookkeepingHandler(HandlerBase):
                 cat = str(item.get("category") or "").strip()
                 if name and cat in categories:
                     cache[name] = cat
+                    fresh[name] = cat
 
         suggestions = [
-            {"merchant": n, "category": cache[n]}
+            {"merchant": n, "category": fresh[n] if n in fresh else cache[n]}
             for n in dict.fromkeys(names)
-            if n in cache
+            if n in fresh or n in cache
         ]
         return ToolResult(ok=True, output={"suggestions": suggestions})
 
