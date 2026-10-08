@@ -339,6 +339,37 @@ def test_taxonomy_domains_have_or_knowingly_lack_handlers(taxonomy, registry):
     assert not unknown, f"词表里的 domain 没有对应 handler：{unknown}"
 
 
+def test_llm_call_timeouts_never_exceed_the_process_bound(repo_root: Path, policy: Policy):
+    """每个声明出来的超时都不得超过进程级硬边界 ``llm_request_timeout_s``。
+
+    这条把一句**只写在注释里的承诺**变成可检查的：``llm_request_timeout_s`` 是
+    httpx 客户端的默认超时，而每次调用都可以被 per-request 的 ``timeout_ms``
+    覆盖（见 ``adapters/openai_compat.py``）。于是"进程级硬边界"只有在所有
+    声明值都不超过它时才成立——否则策略可以主张一次比进程自保上限还长的调用，
+    而没人会发现。
+
+    顺带让 ``direct_llm`` 那个值有据可查：它来自真实延迟测量（见
+    ``routing.policy.yaml`` 里的实测记录），并且必须落在这条界内。
+    """
+    from dispatcher.core.settings import get_settings
+
+    bound_ms = int(get_settings().llm_request_timeout_s * 1000)
+    declared: dict[str, int] = {
+        "evaluator.timeout_ms": policy.evaluator.timeout_ms,
+        "router.timeout_ms": policy.router.timeout_ms,
+        "direct_llm.timeout_ms": policy.direct_llm.timeout_ms,
+        "decomposer.node_defaults.timeout_ms": policy.decomposer.node_defaults["timeout_ms"],
+    }
+    for p in sorted((repo_root / "config" / "flow_templates").glob("*.yaml")):
+        tpl = load_yaml(p)
+        for n in tpl.get("nodes") or []:
+            if n.get("timeout_ms") is not None:
+                declared[f"{p.stem}:{n['id']}"] = n["timeout_ms"]
+
+    over = {k: v for k, v in declared.items() if v > bound_ms}
+    assert not over, f"这些超时超过了进程硬边界 {bound_ms}ms：{over}"
+
+
 def test_capability_names_use_dotted_namespace(registry):
     """能力名统一用 ``<领域>.<动作>``，与档位能力（如 vision.extract）同构。
 
