@@ -233,10 +233,65 @@ class Dispatcher:
                 t.cancel()
         if self._running:
             await asyncio.gather(*self._running.values(), return_exceptions=True)
+        # 两个存储都要关。此前只关 state：sqlite 后端下演化库的连接**没有出账**，
+        # 每次"重启"（进程内重建 Dispatcher）都会多留一个连接与文件句柄。
         close = getattr(self.state, "close", None)
         if close is not None:
             await close()
+        evo_close = getattr(self.evolution_store, "close", None)
+        if evo_close is not None:
+            await evo_close()
         await self.llm.aclose()
+
+    # ------------------------------------------------------------------
+    async def astart(self) -> None:
+        """启动侧的异步准备。``build()`` 是同步的，但打开 sqlite 与读回已批准的
+        策略都必须等 I/O，因此分两步：``build()`` 装配，``astart()`` 接上存储。
+
+        两件事：
+
+        1. **打开状态库**。``SqliteStateStore`` 是 ``open → 用 → close`` 的用法，
+           而 ``build()`` 只构造不打开——不打开的话第一个请求会撞上
+           "SqliteStateStore 尚未 open()"。内存实现没有 ``open``，跳过。
+        2. **把已批准的策略版本读回来**。批准端点会热换内存里的策略
+           （``apply_policy``），但进程一重启就只剩 ``config/routing.policy.yaml``
+           的内容——用户批准过的改动静默消失，看起来像"批准了没用"
+           （docs/12-deployment.md 第 7 节 #5）。
+        """
+        opener = getattr(self.state, "open", None)
+        if opener is not None:
+            await opener()
+        await self._restore_active_policy()
+
+    async def _restore_active_policy(self) -> None:
+        """库里的 active/canary 版本优先于 YAML 文件。"""
+        if self.evolution_store is None:
+            return
+        active = await self.evolution_store.active_version()
+        if active is None:
+            return
+        version_id = str(active.get("policy_version") or "")
+        if not version_id or version_id == self.policy.policy_version:
+            return
+        policy_dict = active.get("policy")
+        if not isinstance(policy_dict, dict):
+            log.error(
+                "演化库里的生效策略版本 %s 没有策略正文，继续用 %s 的内容。",
+                version_id, self.policy.policy_version,
+            )
+            return
+        try:
+            self.apply_policy(policy_dict)
+        except Exception as e:
+            # 不静默：这正是"以为生效了其实没有"的现场，必须在启动日志里留下痕迹。
+            log.error(
+                "演化库里的生效策略版本 %s 无法装载（%r），继续用 %s 的内容。",
+                version_id, e, self.policy.policy_version,
+            )
+            return
+        log.info(
+            "已恢复生效策略版本 %s（文件里的版本是 %s）", version_id, policy_dict.get("policy_version")
+        )
 
     # ------------------------------------------------------------------
     # 在册任务的清账
@@ -1067,6 +1122,12 @@ def describe_config(d: Dispatcher) -> str:
             "executable": sorted(d.registry.executable_ids),
             "budget_enforcement": d.policy.enforcement_mode,
             "execution_enabled": d.execution_enabled,
+            # 后端报**实际装上的实现的类名**，而不是回显配置值：配置说 sqlite
+            # 而进程里跑的是内存实现，正是这轮要消掉的那类静默错配，
+            # 因此启动日志必须能证明装的是哪一个。
+            "state_backend": type(d.state).__name__,
+            "evolution_store": type(d.evolution_store).__name__ if d.evolution_store else None,
+            "media_store": type(d.media).__name__,
             "warnings": d.config_warnings,
         },
         ensure_ascii=False,

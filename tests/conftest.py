@@ -86,8 +86,16 @@ def _auth_off_by_default(monkeypatch: pytest.MonkeyPatch):
 
     需要"配了 token 会怎样"的用例，用 ``create_app(auth=AuthConfig(...))`` 显式注入
     （见 tests/test_auth.py），不依赖环境，也就不受这个 fixture 影响。
+
+    **状态后端同理钉成 ``memory``**，理由与上面一行相同，但多一条更要紧的：
+    ``.env.example`` 里 ``DISPATCHER_STATE_BACKEND=sqlite``，而部署清单会让人在
+    服务器上 ``cp .env.example .env`` 之后顺手跑一遍 pytest 复验——不钉住的话，
+    那一次"复验"会直接读写**生产库** ``data/dispatcher.db``：既污染真实数据，
+    又让测试结论取决于上一次跑剩下来的状态。需要测持久化的用例显式覆盖这一项。
     """
     monkeypatch.setenv("DISPATCHER_AUTH_TOKEN", "")
+    monkeypatch.setenv("DISPATCHER_STATE_BACKEND", "memory")
+    monkeypatch.delenv("DISPATCHER_STATE_PATH", raising=False)
     get_settings.cache_clear()
     yield
     get_settings.cache_clear()

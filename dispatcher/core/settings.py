@@ -18,6 +18,7 @@ import os
 import re
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -60,6 +61,26 @@ class Settings(BaseSettings):
     dispatcher_tenant: str = "default"
     dispatcher_user: str = "owner"
 
+    # ---- 状态后端。----
+    # ``memory``（缺省）或 ``sqlite``。这个开关决定四类状态是否跨重启存活：
+    # 任务快照与事件流、已批准的策略版本、已发放的子令牌、上传的媒体。
+    #
+    # **代码缺省是 memory，生产必须显式配 sqlite**：缺省必须是"重启即丢"，
+    # 否则跑一次测试、起一次本地服务就会在仓库里留下一个 ``data/`` 库，
+    # 下次运行读到的是上一次的脏状态——测试之间互相串味，排查时真假难辨。
+    # 生产弄错方向的代价更大，因此不靠缺省值兜底，而是靠两件事：
+    # ``.env.example`` 里这一项**写死 sqlite**（部署清单就是照它 cp 的），
+    # 以及启动时在"看起来是生产"（配了鉴权令牌）却跑内存后端时打一条 ERROR。
+    #
+    # 值域用 ``Literal`` 而不是 ``str``：拼错成 "sqlite3" 时必须在**启动**就报错，
+    # 而不是静默退回内存后端——后者正是"用户以为生效了其实没有"的那类事故。
+    dispatcher_state_backend: Literal["memory", "sqlite"] = "memory"
+    # sqlite 库文件位置。缺省 ``None`` 表示 ``<仓库根>/data/dispatcher.db``。
+    # 生产建议指到仓库外（如 ``/var/lib/smart-dispatcher/dispatcher.db``）：
+    # systemd 单元用的 ``ProtectSystem=full`` 只读系统目录，仓库仍可写，
+    # 但把运行期数据放在代码目录里会让"重新部署 = 覆盖数据"变成一个必须记得的事。
+    dispatcher_state_path: Path | None = None
+
     # ---- 请求体与连接的自保上限。----
     # 与 llm_qps/llm_max_concurrency 同类：属于"这个进程怎么保护自己"，
     # 不是可调的产品策略，因此在这里而不是在策略文件里。
@@ -78,6 +99,16 @@ class Settings(BaseSettings):
     # 过期媒体的清理周期（秒）。docs/05-media.md 承诺过"由定时任务驱动"，
     # 此前那个定时任务不存在。
     dispatcher_media_sweep_interval_s: float = 300.0
+    # 媒体存储的**总字节上界**。保留期只保证"过期的会被清掉"，不保证"没到期的
+    # 不会堆积"——上传了却一直没被任务引用的截图要躺满整个保留期（缺省 1 天）。
+    # 没有这个上界，2G 机器上 100 张 10 MiB 截图就是 1G（docs/12-deployment.md 第 7 节）。
+    #
+    # 128 MiB 不是估的：实测 ``InMemoryMediaStore`` 每张 10 MiB 截图的常驻成本
+    # 是 **10.00 MiB RSS**（载荷与 RSS 近似 1:1，12 张 120 MiB 载荷 → RSS +120.15 MiB）。
+    # 因此这个数字**就是**媒体那一块的 RSS 上界：128 MiB ≈ 12 张满额截图 ≈ 2G 的 6%，
+    # 相比"无界"把最坏情况压掉约 8 倍，同时给 LLM 响应、SSE 连接与解释器本身留下余量。
+    # 0 或负数表示不限制（明确关掉这个闸，与 dispatcher_sse_max_connections 同口径）。
+    dispatcher_media_max_total_bytes: int = 128 * 1024 * 1024
 
     # 调用的硬边界。与 routing.policy.yaml 的 limits 是两回事：
     # 那些是策略（可被建议修改），这些是进程级的自保（不可被任何东西改）。
@@ -116,6 +147,16 @@ class Settings(BaseSettings):
     @property
     def schemas_dir(self) -> Path:
         return self.contract_root / "schemas"
+
+    # ------------------------------------------------------------------
+    @property
+    def state_db_path(self) -> Path:
+        """sqlite 后端用的库文件。缺省放在仓库根的 ``data/`` 下。
+
+        放在这里而不是散在各处现算：状态、演化、令牌三个存储**共用同一个文件**
+        （它们本来就是一个部署的一份数据），各自算一遍迟早算出三个不同的路径。
+        """
+        return self.dispatcher_state_path or (REPO_ROOT / "data" / "dispatcher.db")
 
     # ------------------------------------------------------------------
     def resolve_secret(self, ref: str) -> str:

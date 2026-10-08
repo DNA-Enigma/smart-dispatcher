@@ -30,7 +30,7 @@ from ..core.runlog import HumanSignal
 from ..core.settings import get_settings
 from ..core.state import TERMINAL_STATUSES
 from ..evolution.loop import PolicyRollback, SuggestionApproval, SuggestionRejection
-from ..pipeline import Dispatcher, describe_config
+from ..pipeline import Dispatcher, DispatcherConfig, describe_config
 from .auth import AuthConfig, BearerAuthMiddleware, request_identity
 from .limiter import ConnectionLimiter
 from .problems import problem_response
@@ -97,12 +97,37 @@ def get_dispatcher() -> Dispatcher:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _dispatcher
-    _dispatcher = Dispatcher.build()
+    settings = get_settings()
+    # 后端从 ``.env`` 来，而不是在代码里写死。此前这里调的是
+    # ``Dispatcher.build()``（不传 config），于是 ``state_backend`` 永远取
+    # DispatcherConfig 的缺省值 "memory"——**生产必然跑内存后端，改 .env 换不了**
+    # （docs/12-deployment.md 第 7 节末）。这一行就是那个缺口的补丁。
+    _dispatcher = Dispatcher.build(
+        DispatcherConfig(
+            settings=settings,
+            state_backend=settings.dispatcher_state_backend,
+            sqlite_path=settings.dispatcher_state_path,
+        )
+    )
+    # 打开状态库、恢复库里的生效策略。必须在开放请求之前完成。
+    await _dispatcher.astart()
+    if (
+        settings.dispatcher_state_backend == "memory"
+        and settings.dispatcher_auth_token
+    ):
+        # 与"配了 token 却空着"那条同口径：不静默。配了鉴权令牌说明这是
+        # 生产形态，而内存后端意味着重启后所有子令牌失效、已批准的策略回退。
+        log.error(
+            "状态后端是 memory（重启即丢：任务快照、事件流、已发放子令牌、"
+            "已批准的策略版本、上传的媒体全部消失），但已配置 DISPATCHER_AUTH_TOKEN"
+            "——这看起来是生产部署。请设 DISPATCHER_STATE_BACKEND=sqlite"
+            "（见 .env.example）。"
+        )
     log.info("smart-dispatcher 启动：%s", describe_config(_dispatcher))
     # 过期媒体的周期清理：docs/05-media.md 承诺"由定时任务驱动"，而此前
     # sweep_expired 全仓没有调用点——缺的正是这个任务。
     sweeper = asyncio.create_task(
-        _dispatcher.media_sweeper(get_settings().dispatcher_media_sweep_interval_s)
+        _dispatcher.media_sweeper(settings.dispatcher_media_sweep_interval_s)
     )
     try:
         yield
