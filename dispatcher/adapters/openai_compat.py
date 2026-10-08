@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import time
 from typing import Any
@@ -27,6 +28,8 @@ from ..core.errors import DispatcherError
 from ..core.policy import Policy
 from ..core.settings import Settings
 from ..ports.llm import LLMError, LLMMessage, LLMResult
+
+log = logging.getLogger(__name__)
 
 # 模型有时会把 JSON 包在 ```json 围栏里，或在前后写一句话。
 # 这里只做"把最外层的 JSON 对象抠出来"这一件事，不做任何修复性猜测——
@@ -328,6 +331,16 @@ class OpenAICompatibleLLM:
                         f"请只输出一个 JSON 对象，不要围栏、不要解释。"
                     ),
                 ]
+        # 失败时必须留下原始响应：上游只看到"计划没有任何节点"，
+        # 真正的原因（模型吐了围栏外的文字？空 content？截断？）全在这段里。
+        # 没有它，这条错误链只能靠猜——fin2 端到端时已经栽过一次。
+        log.warning(
+            "generate_json 失败：tier=%s attempts=%d err=%s | 原始响应: %s",
+            tier,
+            max_repair_attempts + 1,
+            last_err,
+            (result.text[:800] if result is not None and result.text else "<空>"),
+        )
         raise LLMError(f"多次尝试后仍无法得到合法 JSON：{last_err}", retryable=False)
 
 

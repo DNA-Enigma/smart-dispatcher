@@ -64,3 +64,52 @@ def test_load_dotenv_runs_before_app_import() -> None:
         "load_dotenv() 必须排在 import app 之前——"
         "create_app() 会同步读 Settings，晚于 import 就读到空配置"
     )
+
+
+def test_logging_configured_at_module_level() -> None:
+    """``logging.basicConfig`` 也必须在顶层——与 .env 是同一类病。
+
+    藏进 ``if __name__`` 块时，按文档启动**没有任何应用日志**：评估器降级、
+    节点失败只剩任务快照里一行 detail，排障只能靠猜。
+    """
+    tree = ast.parse(MAIN_PY.read_text(encoding="utf-8"))
+    names: list[str] = []
+    for node in tree.body:
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+            func = node.value.func
+            if isinstance(func, ast.Attribute) and func.attr == "basicConfig":
+                names.append("logging.basicConfig")
+            elif isinstance(func, ast.Name) and func.id == "basicConfig":
+                names.append("logging.basicConfig")
+    assert "logging.basicConfig" in names, (
+        "logging.basicConfig() 不在模块顶层——按文档启动时应用日志全丢失"
+    )
+
+
+def test_nothing_load_bearing_left_in_main_guard() -> None:
+    """``if __name__ == "__main__"`` 里只该剩 uvicorn.run —— 别再往里塞初始化。
+
+    这条是通用闸：本仓已经栽过两次（load_dotenv、basicConfig），
+    任何"必须在 import 时生效"的调用进了这个块都是静默失效。
+    """
+    tree = ast.parse(MAIN_PY.read_text(encoding="utf-8"))
+    allowed = {"run"}
+    for node in tree.body:
+        if not isinstance(node, ast.If):
+            continue
+        test = node.test
+        if not (
+            isinstance(test, ast.Compare)
+            and isinstance(test.left, ast.Name)
+            and test.left.id == "__name__"
+        ):
+            continue
+        for inner in ast.walk(node):
+            if isinstance(inner, ast.Call):
+                f = inner.func
+                name = f.id if isinstance(f, ast.Name) else getattr(f, "attr", "")
+                assert name in allowed, (
+                    f"if __name__ 块里出现 {name}()——初始化调用必须放模块顶层，"
+                    "否则按 python -m uvicorn main:app 启动时永不执行"
+                )
+
