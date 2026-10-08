@@ -29,6 +29,7 @@ from ..core.execution import ClarificationAnswer
 from ..core.runlog import HumanSignal
 from ..core.settings import get_settings
 from ..core.state import TERMINAL_STATUSES
+from ..evolution.loop import PolicyRollback, SuggestionApproval, SuggestionRejection
 from ..pipeline import Dispatcher, describe_config
 from .auth import AuthConfig, BearerAuthMiddleware, request_identity
 from .limiter import ConnectionLimiter
@@ -497,9 +498,11 @@ def create_app(*, auth: AuthConfig | None = None) -> FastAPI:
         identity = request_identity(request)
         # ``allow_empty``：这个端点历史上允许不带请求体（scope/note 都是可选的），
         # 空体继续按 {} 处理，只是非法 JSON 不再是 500 而是 400 Problem。
-        body = await read_json_document(
-            request,
+        body = await read_body(
+            request, SuggestionApproval,
             endpoint="POST /v1/evolution/suggestions/{suggestion_id}/approve",
+            # 契约写着 ``requestBody.required: false``：不带参数的"批准"是合法的，
+            # 统一读体路径不能顺手把它拒掉（有测试钉住这一条）。
             allow_empty=True,
         )
         version = await loop.approve(
@@ -523,13 +526,17 @@ def create_app(*, auth: AuthConfig | None = None) -> FastAPI:
     async def reject_suggestion(suggestion_id: str, request: Request) -> dict[str, Any]:
         _, loop = _require_evolution()
         identity = request_identity(request)
-        body = await read_json_document(
-            request, endpoint="POST /v1/evolution/suggestions/{suggestion_id}/reject"
+        body = await read_body(
+            request, SuggestionRejection,
+            required=("reason",),
+            endpoint="POST /v1/evolution/suggestions/{suggestion_id}/reject",
         )
-        if not body.get("reason"):
+        if not body["reason"].strip():
+            # 类型已由模型挡住，这里只剩"给了个空串"。它与"没给"不同：
+            # 客户端确实发了这个字段，只是内容什么都没说，而理由本身是信号。
             raise DispatcherError("invalid_request", "拒绝必须给出理由——理由本身是信号")
         updated = await loop.reject(
-            suggestion_id, reason=str(body["reason"]),
+            suggestion_id, reason=body["reason"],
             decided_by=identity.user_id,
         )
         return {"suggestion_id": suggestion_id, "status": updated["status"]}
@@ -550,9 +557,14 @@ def create_app(*, auth: AuthConfig | None = None) -> FastAPI:
     @app.post("/v1/policy/rollback")
     async def rollback_policy(request: Request) -> dict[str, Any]:
         d, loop = _require_evolution()
-        body = await read_json_document(request, endpoint="POST /v1/policy/rollback")
-        to_version = str(body.get("to_version") or "")
+        body = await read_body(
+            request, PolicyRollback,
+            required=("to_version",), endpoint="POST /v1/policy/rollback",
+        )
+        to_version = body["to_version"]
         if not to_version:
+            # 空串与"没给"分开：前者是客户端给了个空的版本号，报 invalid_request
+            # 比让它一路走到存储层变成 404 not_found 更贴近事实。
             raise DispatcherError("invalid_request", "缺少 to_version")
         version = await loop.rollback(to_version=to_version, note=body.get("note"))
         d.apply_policy(version["policy"])

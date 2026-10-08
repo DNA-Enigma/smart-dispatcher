@@ -1,11 +1,18 @@
 """请求体读取与校验。
 
-**进流水线之前请求体只有一条路**（这个模块），因为路径分叉过一次：``clarify`` /
-``feedback`` 走了这里的 ``read_body``，而 ``create_task`` / ``approve`` / ``reject`` /
-``rollback`` 四处是端点里裸 ``await request.json()``。分叉的代价是**错误形状不一致**：
-``Request.json()`` 抛的是 ``JSONDecodeError``，它不是 ``DispatcherError``，于是绕过
-``app.py`` 的处理器、冒到 ServerErrorMiddleware 变成 500 纯文本——把**输入的错**
-报成**服务端的错**，客户端拿到的还不是契约里的 ``Problem``。
+**进流水线之前请求体只有一条路**（这个模块），因为路径分叉过两次：
+
+* 第一段：``clarify`` / ``feedback`` 走了 ``read_body``，而 ``create_task`` /
+  ``approve`` / ``reject`` / ``rollback`` 四处是端点里裸 ``await request.json()``。
+  分叉的代价是**错误形状不一致**：``Request.json()`` 抛的是 ``JSONDecodeError``，
+  它不是 ``DispatcherError``，于是绕过 ``app.py`` 的处理器、冒到 ServerErrorMiddleware
+  变成 500 纯文本——把**输入的错**报成**服务端的错**，客户端拿到的还不是契约里的
+  ``Problem``。
+* 第二段：那四处改用了 ``read_json_document``，**读取**统一了，但**校验**还是各写
+  各的（``if not body.get("reason")``、``str(body.get("to_version") or "")``）。
+  于是"缺必填"有的给 400 带 ``context.missing``、有的给一句手写的 detail，类型错
+  则一概不查——``{"reason": 123}`` 会被 ``str()`` 悄悄转成 ``"123"`` 收下。
+  现在这四处也走 ``read_body``，两条路才真的合成一条。
 
 这里在**进入流水线之前**把协议边界该做的四件事补上：
 
@@ -89,8 +96,8 @@ async def read_json_document(
 ) -> dict[str, Any]:
     """读一个 JSON 对象请求体。``allow_empty`` 时空体返回 ``{}``。
 
-    不给模型的端点（``approve`` / ``reject`` / ``rollback`` 自己从 dict 取字段）
-    用这个；给了模型的用 ``read_body``，它在下面复用本函数。
+    没有对应模型的端点（``create_task`` 的包封由 :class:`TaskEnvelope` 之外的一层
+    组装）用这个；有模型的用 ``read_body``，它在下面复用本函数。
     """
     raw_bytes = await read_raw_body(request, endpoint=endpoint, max_bytes=max_bytes)
     if not raw_bytes:
@@ -116,6 +123,7 @@ async def read_body(
     *,
     required: tuple[str, ...] = (),
     endpoint: str,
+    allow_empty: bool = False,
 ) -> dict[str, Any]:
     """读并校验请求体，返回**已剥掉未知字段**的 dict，可直接交给流水线。
 
@@ -123,10 +131,14 @@ async def read_body(
     与模型的默认值无关：``ClarificationAnswer`` 每个字段都有默认值（流水线能从
     记录里回填），但线路上仍要求客户端回传 ``question_id`` 以确认答的是哪一问。
 
+    ``allow_empty`` 给"整段请求体可缺"的端点用（``approve`` 的 ``openapi.yaml``
+    写着 ``requestBody.required: false``）。它只放宽"空体"这一种，非法 JSON 与
+    非对象仍然是 400——"没带参数"与"带了一段看不懂的东西"不是同一件事。
+
     读取与解析复用 ``read_json_document``，**不再自己 ``request.body()``**——
     两条读取路径就是两份上限判定与两套错误形状，那正是本轮要合掉的东西。
     """
-    raw = await read_json_document(request, endpoint=endpoint)
+    raw = await read_json_document(request, endpoint=endpoint, allow_empty=allow_empty)
 
     missing = [f for f in required if raw.get(f) is None]
     if missing:

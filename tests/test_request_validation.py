@@ -286,10 +286,58 @@ async def test_reject_malformed_json_is_400_not_500(evo_client, schemas):
 
 
 async def test_reject_without_reason_is_400(evo_client, schemas):
-    """理由本身是信号，缺了就拒——这条是老行为，钉住它没被读体路径改掉。"""
+    """理由本身是信号，缺了就拒——这条是老行为，钉住它没被读体路径改掉。
+
+    走 ``read_body`` 之后 detail 变成了通用的"缺少必填字段"，但**缺哪些**现在
+    与 ``clarify`` 同一形状地写在 ``context.missing`` 里，机器可读。
+    """
     resp = await evo_client.post(REJECT, json={"note": "忘了写理由"})
     body = _assert_problem(schemas, resp, status=400)
+    assert body["context"]["missing"] == ["reason"]
+
+
+async def test_reject_blank_reason_is_400(evo_client, schemas):
+    """空串不是"没给"，是"给了但什么都没说"——它同样不构成信号。
+
+    这条此前**不成立**：``str(body["reason"])`` 会把任何东西转成字符串收下，
+    因此 ``reason: 123`` 会变成 ``"123"`` 一路进流水线，而 ``reason: ""`` 靠一句
+    手写的 ``if not body.get(...)`` 才挡下来。现在类型归模型、空串归领域规则。
+    """
+    resp = await evo_client.post(REJECT, json={"reason": "   "})
+    body = _assert_problem(schemas, resp, status=400)
     assert "理由" in body["detail"]
+
+
+async def test_reject_reason_of_wrong_type_is_400(evo_client, schemas):
+    """``reason`` 契约是 ``string``。传数字是**请求**的错，不是把 123 当理由。"""
+    resp = await evo_client.post(REJECT, json={"reason": 123})
+    body = _assert_problem(schemas, resp, status=400)
+    assert body["context"]["errors"][0]["field"] == "reason"
+
+
+async def test_reject_unknown_field_is_accepted_with_warning(evo_client, caplog):
+    with caplog.at_level(logging.WARNING, logger="dispatcher"):
+        resp = await evo_client.post(REJECT, json={"reason": "方向错了", "why": "多余的"})
+    assert resp.status_code == 200, resp.text
+    assert "why" in caplog.text
+
+
+async def test_approve_scope_of_wrong_type_is_400(evo_client, schemas):
+    """``scope`` 契约是对象。此前它原样进 ``loop.approve``，由下游某处才炸。"""
+    resp = await evo_client.post(APPROVE, json={"scope": "app"})
+    body = _assert_problem(schemas, resp, status=400)
+    assert body["context"]["errors"][0]["field"] == "scope"
+
+
+async def test_approve_unknown_field_is_kept_out_but_not_rejected(evo_client, evo, caplog):
+    """未知字段**放行但剥掉**——不认识的键不该在下游悄悄生效。"""
+    with caplog.at_level(logging.WARNING, logger="dispatcher"):
+        resp = await evo_client.post(
+            APPROVE, json={"scope": {"level": "app"}, "future_field": 123}
+        )
+    assert resp.status_code == 200, resp.text
+    assert evo.evolution.approved[0]["scope"] == {"level": "app"}
+    assert "future_field" in caplog.text
 
 
 async def test_rollback_malformed_json_is_400_not_500(evo_client, schemas):
@@ -298,6 +346,24 @@ async def test_rollback_malformed_json_is_400_not_500(evo_client, schemas):
     )
     # 空对象是**合法 JSON**，缺 to_version 是另一条 400；先钉住它不是 500
     _assert_problem(schemas, resp, status=400)
+
+
+async def test_rollback_missing_to_version_is_400(evo_client, schemas):
+    resp = await evo_client.post(ROLLBACK, json={})
+    body = _assert_problem(schemas, resp, status=400)
+    assert body["context"]["missing"] == ["to_version"]
+
+
+async def test_rollback_blank_to_version_is_400_not_404(evo_client, schemas):
+    """空串是**请求**的错（400），不是"版本不存在"（404）——别把输入问题带进存储层。"""
+    resp = await evo_client.post(ROLLBACK, json={"to_version": ""})
+    _assert_problem(schemas, resp, status=400)
+
+
+async def test_rollback_to_version_of_wrong_type_is_400(evo_client, schemas):
+    resp = await evo_client.post(ROLLBACK, json={"to_version": 7})
+    body = _assert_problem(schemas, resp, status=400)
+    assert body["context"]["errors"][0]["field"] == "to_version"
 
 
 async def test_rollback_not_json_at_all_is_400_not_500(evo_client, schemas):

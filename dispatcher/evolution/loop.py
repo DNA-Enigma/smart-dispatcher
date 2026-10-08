@@ -24,11 +24,58 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from pydantic import BaseModel, ConfigDict
+
 from ..core.errors import DispatcherError
 from ..core.policy import Policy
 from ..core.runlog import HumanSignal
 from .analyzer import Analyzer
 from .policy_store import PolicyVersionManager
+
+
+# ---------------------------------------------------------------------------
+# 请求体模型。
+#
+# 放在 ``loop`` 而不是接口层，是为了让"端点允许哪些字段"与它最终要去的方法
+# 挨在一起——``read_body`` 的允许集合从 ``model_fields`` 现取，分开放就又变成
+# "两处各写一份"。这三个模型只描述**线路形状**，业务判断仍在下面的方法里。
+# ---------------------------------------------------------------------------
+class SuggestionApproval(BaseModel):
+    """``POST /v1/evolution/suggestions/{id}/approve``。
+
+    两个字段都可选，**整段请求体也可以缺失**——"批准"这个动作本身不需要参数，
+    缺省的金丝雀范围由 :meth:`EvolutionLoop.approve` 自己推。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    scope: dict[str, Any] | None = None
+    note: str | None = None
+
+
+class SuggestionRejection(BaseModel):
+    """``POST /v1/evolution/suggestions/{id}/reject``。
+
+    ``reason`` 必填：拒绝理由本身就是信号——频繁被拒说明分析在提"看起来合理
+    但没用"的东西，而"没写理由"的拒绝在这个统计里什么都贡献不了。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    reason: str
+
+
+class PolicyRollback(BaseModel):
+    """``POST /v1/policy/rollback``。
+
+    ``scope`` 是契约（``openapi.yaml``）里声明过的字段，但
+    :meth:`PolicyVersionManager.rollback` 目前只吃 ``to_version`` 与 ``note``——
+    因此它**被接受但不起作用**。保留在模型里是为了不让契约声明的字段变成
+    "未知字段"，把这件事记在这里而不是悄悄丢掉。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    to_version: str
+    scope: dict[str, Any] | None = None
+    note: str | None = None
 
 
 @dataclass
@@ -220,4 +267,7 @@ def _after(ts: Any, cutoff: datetime) -> bool:
         return False
 
 
-__all__ = ["EvolutionLoop", "LoopOutcome"]
+__all__ = [
+    "EvolutionLoop", "LoopOutcome",
+    "PolicyRollback", "SuggestionApproval", "SuggestionRejection",
+]
