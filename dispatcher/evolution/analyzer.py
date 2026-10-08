@@ -182,24 +182,41 @@ class Analyzer:
         ]
         policy_snapshot = self._relevant_policy_slice(wire_findings)
 
+        # **证据进 user，指令进 system。** 这份提示词自己的开头写着「RunLog 采样
+        # 只以 ``data_block`` 形式进入 user 消息」，而实现以前把 ``run_log_sample``
+        # 填进了 **system**——提示词声明与实现相反，实测 system 里能拿到用户反馈
+        # （``human_signal.edits[].to``，也就是用户在确认页上填的真值）的全文。
+        #
+        # ``findings`` 一并搬走，同样有实测支撑：``field_edit_hotspot`` 的
+        # ``group`` 是 ``per_key_rate`` 算出来的"最热字段名"，键来自
+        # ``human_signal.edits[].field``——而那条字段是**调用方自由填的字符串**
+        # （``HumanSignal.edits`` 是 ``list[dict[str, Any]]``，没有词表约束），
+        # 于是 findings 里也能落进任意文本。逐个字段净化 ``group`` 是一条要走样的
+        # 路（下一个按 run 值分组的检测器又会开一个口子），而"证据整体进 user"
+        # 是把这条不变量一次说清：**system 里只有指令**。
+        #
+        # 留在 system 的四项都来自人写的配置（策略、建议类型词表、禁区、幅度上限），
+        # 它们是约束，不是证据。
         system = fill(
             self._prompts.get(ANALYSIS_PROMPT),
             {
-                "findings": json.dumps(wire_findings, ensure_ascii=False, indent=2),
-                "run_log_sample": data_block(
-                    f"运行日志抽样（{len(sample)} 条）",
-                    json.dumps([x.to_wire() for x in sample], ensure_ascii=False, indent=2),
-                ),
                 "policy_snapshot": json.dumps(policy_snapshot, ensure_ascii=False, indent=2),
                 "suggestion_kinds": json.dumps(kinds, ensure_ascii=False, indent=2),
                 "locked_paths": json.dumps(self._policy.locked_paths, ensure_ascii=False),
                 "max_delta_ratio": f"{self._policy.evolution.max_delta_ratio:.0%}",
             },
         )
+        evidence = data_block(
+            "触发的检测器（指标由确定性检测器算出，不是估计）",
+            json.dumps(wire_findings, ensure_ascii=False, indent=2),
+        ) + "\n\n" + data_block(
+            f"运行日志抽样（{len(sample)} 条）",
+            json.dumps([x.to_wire() for x in sample], ensure_ascii=False, indent=2),
+        )
         return [
             LLMMessage.system(system),
             LLMMessage.user(
-                "请按系统提示的要求，只输出一个建议数组（JSON array）。"
+                evidence + "\n\n请按系统提示的要求，只输出一个建议数组（JSON array）。"
                 "没有值得提的建议就输出 []。"
             ),
         ]

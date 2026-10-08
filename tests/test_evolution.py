@@ -308,6 +308,69 @@ async def test_canary_promotes_when_healthy(policy):
 
 
 # ---------------------------------------------------------------------------
+# 注入分槽：证据进 user 数据块，system 里只有指令
+# ---------------------------------------------------------------------------
+#: 一个"用户自由填的字段名"。契约里 ``human_signal.edits[].field`` 只声明为
+#: ``string``（没有词表），所以它可以是任意文本——这正是它危险的地方。
+CANARY_FIELD = "CANARY_EDIT_FIELD_7d2"
+
+
+def _analyzer(policy, llm):
+    from pathlib import Path
+
+    from dispatcher.core.prompts import PromptLibrary
+    from dispatcher.evolution.analyzer import Analyzer
+
+    return Analyzer(
+        policy=policy, prompts=PromptLibrary(REPO_ROOT / "prompts"), llm=llm,
+        engines_dir=Path(REPO_ROOT) / "config" / "evolution",
+    )
+
+
+def test_analyzer_system_slot_carries_no_evidence_only_instructions(policy, engine):
+    """用户反馈里的自由文本不进 system；证据（findings + 抽样）走 user 的数据块。
+
+    这条刻意做成**端到端**，而不是"造一个报告去问边界"：canary 从
+    ``HumanSignal.edits[].field`` 出发——那是调用方自由填的字符串——经
+    ``field_edit_hotspot`` 的 per_key_rate 变成 finding 的 ``group``，再走到提示词。
+    审计就是沿这条路径实测到 system 命中的，这条测试是它的回归钉。
+
+    ``findings`` 与 ``run_log_sample`` 一起搬，是因为两条路径都通：抽样里带
+    ``human_signal.edits[].to``（用户在确认页填的真值），findings 里带那个自由
+    字段名。只搬一条，另一条照样能把用户文本送进 system。
+    """
+    logs = [
+        log_of(i, signal=HumanSignal(
+            verdict="edited",
+            edits=[{"field": CANARY_FIELD, "from": "其他", "to": "餐饮"}],
+        ))
+        for i in range(20)
+    ]
+    report = engine.run(logs)
+    assert "field_edit_hotspot" in {f.detector_id for f in report.findings}, (
+        "检测器没触发，这条测试就什么也没证明"
+    )
+    assert any(f.group == CANARY_FIELD for f in report.findings), (
+        "canary 没进 findings 的 group，说明走错了路径"
+    )
+
+    messages = _analyzer(policy, ScriptedLLM([]))._messages(report, logs)
+    assert [m.role for m in messages] == ["system", "user"], "分析与模型对话必须是 system + user 两槽"
+    system, user = messages[0].content, messages[1].content
+
+    assert CANARY_FIELD not in system, "用户可控的字段名经 findings 进了 system"
+    assert "餐饮" not in system, "用户填的真值经 run_log_sample 进了 system"
+    assert CANARY_FIELD in user and "餐饮" in user, "证据本身要照常给到模型，只是换个槽位"
+    assert "以下为数据" in user, "user 槽位里的证据必须带 data_block 围栏"
+
+    # 反向锚：搬槽不等于把证据掏空——检测器与样本还得在，否则模型无据可依。
+    assert "field_edit_hotspot" in user
+    assert "触发的检测器" in user and "运行日志抽样" in user
+    # 指令仍在 system：禁区与幅度上限是约束，不是证据。
+    assert "禁区" in system
+
+
+# ---------------------------------------------------------------------------
 # 循环：审批 / 拒绝 / 反馈
 # ---------------------------------------------------------------------------
 def make_loop(policy, responses):
