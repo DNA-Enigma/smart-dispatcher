@@ -212,9 +212,10 @@
 | 错误 detail 为空（P2-8） | ⬜ 未做 | 契约既有缺口（本轮未涉及） |
 | `usage.period/group_by`、`tasks.status/cursor` 契约声明未实现 | ⬜ 未做 | 既有缺口 |
 | `per_user_daily` / `per_tenant_daily` 声明但全仓无引用 | ⬜ 未做 | 日额度形同虚设 |
-| 依赖无 lock 文件（安装不可复现）、CVE 需人工核对 | 🔄 半修 | `30ea364` — `requirements.lock`（2079 字节，精确版本），已在**全新 venv** 装一遍并跑通 460 测试。**CVE 人工核对仍空着**，上线前补 |
+| 依赖无 lock 文件（安装不可复现）、CVE 需人工核对 | ✅ 已修 | `30ea364` — `requirements.lock`（2079 字节，精确版本），全新 venv 装通并跑过测试。`4ccdc0a` — **pip-audit 实扫 37 个依赖，0 个已知漏洞**（结果存 `docs/12-deployment.md`，非口头结论） |
 | 部署就绪检查：状态全在进程内存 | ✅ 已修 | `8630d7c` + `f0561d6` + `846489d` — ①`Settings.dispatcher_state_backend` 接进 `lifespan→Dispatcher.build()`（此前永远取缺省 memory，改 .env 无效）②令牌登记簿接同一库，重启后子令牌仍有效 ③策略版本重启不回退 ④媒体加 128 MiB 上界（超限 413 可重试，**不淘汰已有媒体**——淘汰会产生悬空引用，相关任务必然失败）。**默认仍是 `memory`**（向后兼容），但 memory + 配了 `DISPATCHER_AUTH_TOKEN`（=生产形态）会 `log.error` 明确告警，不静默。测试 460→498，含对照组 `test_memory_backend_still_forgets_on_restart`（证明测试真会红）。**PM 实测**：起服务→发令牌→重启→同令牌 200、假令牌 401、启动日志「已载入已发放令牌 1 枚」。遗留：`media_store` 仍是 `InMemoryMediaStore` |
-| `/docs`、`/openapi.json` 公网无鉴权可达 | ⬜ 未做 | be2 遗留决策点之一（配 token 后 `/docs` 浏览器打不开） |
+| `/docs`、`/openapi.json` 公网无鉴权可达 | ✅ 已修 | `02884c6` — 生产形态（配了 `DISPATCHER_AUTH_TOKEN`）不挂载 `/docs` `/redoc` `/openapi.json`。**PM 实测**：带 token 三者全 **404**（真不挂载，不是被鉴权挡在门口），未带 token 回 `{"detail":"Not Found"}` 不泄露任何 schema；`/v1/health` 200、`/v1/tasks` 带 token 200 / 无 token 401 均正常。**关的是可交互浏览，`openapi.yaml` 契约声明仍在**，契约一致性测试绿（511 全过） |
+| 上游错误体进 `Problem.detail`（泄露主机名/URL/Authorization/账单内容） | ✅ 已修 | `9ac30f9` — **从源头切，不在渲染处擦**：`str(LLMError)` 本身安全，因为该字符串会被阶段 notes、nodeexec、direct、runner 多处再加工，逐处脱敏必漏一处。原文留在 `provider_detail`/`internal` 供服务端排障。**反例验红**：把 `_http_error` 的 message 改回拼原文 → 测试红。+13 测试（498→511），覆盖每个状态码、网络异常、密钥路径四类 | be2 遗留决策点之一（配 token 后 `/docs` 浏览器打不开） |
 | `Last-Event-ID`/`since` 超长数字串 `int()` → 稳定 500；`?limit=abc` → 422 非 Problem 体；`sse.replay` SQL 未传 limit | ⬜ 未做 | be4 看到但点名范围外，同类缺陷、改法同为「不可信则退化/夹取」 |
 
 ### 客户端 ai-bookkeeping
