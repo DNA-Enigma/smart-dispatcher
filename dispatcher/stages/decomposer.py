@@ -433,6 +433,8 @@ class Decomposer:
         messages = self._messages(envelope, profile, decision)
         violations: list[str] = []
 
+        call_error: Exception | None = None
+
         for revision in range(1, max_replans + 2):
             try:
                 raw, res = await self._llm.generate_json(
@@ -451,26 +453,43 @@ class Decomposer:
                         subtask_id="__decomposer__",
                         note="stage:decomposer",
                     )
+                call_error = None
             except (LLMError, DispatcherError) as e:
                 if getattr(e, "fatal", False):
                     raise
-                meta.notes.append(f"拆解调用失败：{e}")
+                # **调用失败不是"返回了空"。** 两者都会让这一版没有节点，但该说的话
+                # 不一样：一个是"这次调用没成功，真因是 <e>"，另一个才是"模型答了，
+                # 但答的是空的"。以前这里把 ``raw`` 置空后就交给 ``validate_plan``，
+                # 校验器照自己的规则报"LLM 拆解返回了空 nodes"——把**调用失败**
+                # 说成了**返回空**，实测误导过一整轮排障（真因只留在 notes 里）。
+                call_error = e
                 raw = {}
+                meta.notes.append(f"拆解调用失败：{e}")
 
-            plan = self._plan_from_raw(raw, decision, task_id, revision)
-            violations = validate_plan(
-                plan, policy=self._policy, registry=self._registry,
-                tool_set=decision.tool_set, agents=self._agents,
-                decision_budget=decision.budget,
-            )
             meta.revisions = revision
-            if not violations:
-                meta.violations = []
-                return plan
+            if call_error is not None:
+                # 这一次没有可校验的产出：空计划不是模型给的，别拿去问校验器，
+                # 直接以"调用失败 + 真实原因"作为这一版的违规原因。
+                violations = [f"拆解调用失败：{call_error}"]
+            else:
+                plan = self._plan_from_raw(raw, decision, task_id, revision)
+                violations = validate_plan(
+                    plan, policy=self._policy, registry=self._registry,
+                    tool_set=decision.tool_set, agents=self._agents,
+                    decision_budget=decision.budget,
+                )
+                if not violations:
+                    meta.violations = []
+                    return plan
+                meta.notes.append(f"第 {revision} 版计划未通过校验：{violations}")
 
-            meta.notes.append(f"第 {revision} 版计划未通过校验：{violations}")
             if revision > max_replans:
                 break
+            if call_error is not None:
+                # 调用失败时没有"模型的上一次输出"可以回灌——把不存在的输出当成
+                # 它的回答喂回去，只会让它以为上一轮答过 `{}`。原样重发这一次请求，
+                # 这才是"再调一次"。
+                continue
             # 把违规点回灌再试——原样重试往往得到同样的问题，而"哪里不合法"
             # 是模型能修的信息（它不需要自己猜规则）
             messages = messages + [
@@ -483,10 +502,15 @@ class Decomposer:
             ]
 
         meta.violations = violations
+        # 收尾这条消息要说清**是哪一类失败**：全程调不通与"模型反复返空"
+        # 对应完全不同的处置（查上游 / 调提示词），混成一句话就没法排查。
+        detail = (
+            f"拆解调用失败（最后一次尝试，共 {meta.revisions} 次）：{call_error}"
+            if call_error is not None
+            else f"拆解在 {meta.revisions} 次尝试后仍未产出合法计划：{violations}"
+        )
         raise DispatcherError(
-            "policy_violation",
-            f"拆解在 {meta.revisions} 次尝试后仍未产出合法计划：{violations}",
-            context={"violations": violations},
+            "policy_violation", detail, context={"violations": violations}
         )
 
     # ------------------------------------------------------------------

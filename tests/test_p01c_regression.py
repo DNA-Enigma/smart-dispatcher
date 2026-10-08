@@ -228,6 +228,54 @@ async def test_empty_decomposition_names_the_empty_plan_not_the_strategy(empty_r
         await d.aclose()
 
 
+async def test_decompose_call_failure_is_not_reported_as_an_empty_return():
+    """**调用失败**与**真的返回空**是两件事，文案不能混。
+
+    空计划还有第二种来法：``_freeform`` 的 ``except`` 分支。以前的实现把
+    ``raw`` 置成 ``{}`` 后照常交给 ``validate_plan``，于是校验器按自己的规则报
+    "LLM 拆解返回了空 nodes"——把**这一次调用没成功**说成了**模型返回空**。
+    实测误导过一整轮排障：真因（上游抖动）只留在 ``meta.notes`` 里，而那时
+    notes 还不对外暴露。
+
+    这里让拆解器的两次尝试都因预置响应耗尽而抛 ``LLMError``，断言文案指向调用本身。
+    """
+    # 只给评估与路由两次响应：拆解器的两次尝试都拿到"没有更多预置响应"的 LLMError。
+    llm = ScriptedLLM([DEGRADED_PROFILE, FREEFORM_DECISION])
+    d = make_dispatcher(llm)
+    try:
+        env = await receipt_envelope(d, authoritative=False, intent=None)
+        with pytest.raises(DispatcherError) as ei:
+            await d.submit(env)
+        assert ei.value.code == "policy_violation"
+        assert "拆解调用失败" in ei.value.detail
+        # 真实原因必须带上——只说"失败了"等于换了一种误导
+        assert "没有更多预置响应" in ei.value.detail
+        # 这是本条的核心反例：调用失败不能被说成返回空
+        assert "返回了空 nodes" not in ei.value.detail
+    finally:
+        await d.aclose()
+
+
+async def test_decompose_that_truly_returns_empty_still_says_empty_nodes():
+    """反向对照：调用成功但内容是空的，仍然必须说"返回了空 nodes"。
+
+    没有这条，"区分两种情况"就可能被做成"凡空计划都说调用失败"——那只是把
+    误导换了个方向。两条路径的形状不同，都要钉住。
+    """
+    # 两次调用都成功、都返回 `{}`：模型答了，答的是空的。
+    llm = ScriptedLLM([DEGRADED_PROFILE, FREEFORM_DECISION, {}, {}])
+    d = make_dispatcher(llm)
+    try:
+        env = await receipt_envelope(d, authoritative=False, intent=None)
+        with pytest.raises(DispatcherError) as ei:
+            await d.submit(env)
+        assert ei.value.code == "policy_violation"
+        assert "返回了空 nodes" in ei.value.detail
+        assert "拆解调用失败" not in ei.value.detail
+    finally:
+        await d.aclose()
+
+
 # ===========================================================================
 # B 组 —— 权威声明在评估器降级时不能丢
 # ===========================================================================
