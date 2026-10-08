@@ -122,15 +122,28 @@ npx @redocly/cli lint openapi.yaml
 实现语言是 Python（FastAPI），因为两个现有后端都是 Python，可直接 import；
 安卓记账 APP 作为客户端走 HTTP。
 
+**可复现安装**（锁文件 `requirements.lock`，全部精确钉版；换台机器结果一致）：
+
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install -e ".[dev]"          # 或见 pyproject.toml 的依赖表
+.venv/bin/pip install -r requirements.lock   # 第三方依赖，含 dev（pytest / ruff）
+.venv/bin/pip install --no-deps -e .         # 本项目自身；--no-deps 不可省，见下
 
-cp .env.example .env                        # 填 LLM_API_KEY / LLM_BASE_URL / 三个档位的模型名
+cp .env.example .env                         # 填 LLM_API_KEY / LLM_BASE_URL / 三个档位的模型名
 
 .venv/bin/python -m pytest -q                # 全部测试 + 契约一致性 + 架构不变式
 .venv/bin/python -m uvicorn main:app --port 8000
 ```
+
+`--no-deps` 是必需的：不加的话 pip 会按 `pyproject.toml` 的区间（`>=`）重新解析，
+把锁文件钉住的版本升降掉，锁就白锁了。
+
+改动依赖时：编辑 `pyproject.toml`，在**干净 venv** 里 `pip install -e ".[dev]"`
+后 `pip freeze` 重新生成 `requirements.lock`（生成与安装的完整说明见文件头注释）。
+开发时想装可变区间，仍可用 `.venv/bin/pip install -e ".[dev]"`。
+
+云服务器上的部署（systemd、反代、健康检查、进程内存态清单）见
+[docs/12-deployment.md](docs/12-deployment.md)。
 
 **能做什么**
 
