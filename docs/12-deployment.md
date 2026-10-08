@@ -60,7 +60,7 @@ cp .env.example .env && chmod 600 .env          # 填密钥，见第 2 节
 | `main.py:33` | `uvicorn.run(..., host="127.0.0.1", port=8000)` | 只在 `python main.py` 时生效；`-m uvicorn` 启动时走命令行参数，**不用改** |
 | `openapi.yaml:32` | server `http://127.0.0.1:8000/v1` | **不改**。它是给本地调试看的；且 `tests/test_auth_contract.py:120-126` 钉住了这一条 |
 | `settings.py:28` | `REPO_ROOT` = 源文件上溯三级 | 不用改，但决定了仓库不能挪（见第 1 节） |
-| `pipeline.py:190,201` | sqlite 缺省路径 `REPO_ROOT/data/dispatcher.db` | 当前**用不到**（默认内存后端，见第 7 节） |
+| `settings.py` | sqlite 缺省路径 `REPO_ROOT/data/dispatcher.db` | sqlite 后端下**会用到**；建议改用 `DISPATCHER_STATE_PATH` 指到仓库外，见第 7 节 |
 
 结论：**没有需要改代码才能上云的硬编码**。改动的都是命令行参数与 `.env`。
 
@@ -227,19 +227,18 @@ nginx 上对应的是 `proxy_next_upstream` 之类的重试策略：本服务是
 
 ## 7. 进程内状态清单（重启即丢）
 
-这是上云后用户会直接遇到的坑，逐条列出。**当前部署跑的是全内存后端**：
-`lifespan` 调用 `Dispatcher.build()`（`app.py:100`），不传 config，
-于是 `DispatcherConfig.state_backend` 取默认值 `"memory"`（`pipeline.py:81`）。
-**全进程不落任何盘**（已用 grep 核对：全仓无写文件调用；`data/` 目录根本不存在）。
+这是上云后用户会直接遇到的坑，逐条列出。**缺省后端是 `memory`**，
+但生产按 `.env.example` 配 `DISPATCHER_STATE_BACKEND=sqlite` 后，下表里
+#1/#2/#4/#5/#6 都会跨重启存活（见本节末「换成持久后端」）。
 
-| # | 状态 | 存哪 | 重启后 | 可接受？ |
+| # | 状态 | 存哪 | 内存后端重启后 | 可接受？ |
 |---|---|---|---|---|
-| 1 | **任务快照**（envelope、状态、节点进度、artifacts） | `InMemoryStateStore`（`pipeline.py:203`） | **全丢** | ⚠️ 受影响：客户端拿着 task_id 查询会 404。用户看到的是"任务凭空消失" |
-| 2 | **事件流**（SSE 重放源） | 同上（`EventBus` 建在 state 上） | **全丢** | ⚠️ 断线重连的 `Last-Event-ID` 重放失效，任务本身也没了，同 #1 |
-| 3 | **上传的媒体**（金融截图 blob） | `InMemoryMediaStore`（`pipeline.py:211`）——**写死，与 `state_backend` 无关** | **全丢** | ⚠️ `media_id` 变悬空引用，相关任务必然失败。另外它常驻内存：单张上限 10 MiB（`routing.policy.yaml:427`），缺省保留 1 天，100 张就是 1G——**2G 机器上这是最现实的内存风险** |
-| 4 | **已发放的子令牌** | `TokenRegistry`（`app.py:144`，挂在 app.state） | **全丢** | ❌ **不可接受**：所有子令牌持有者当场 401，必须重新发放。`.env.example:27` 与 `docs/03-http-contract.md:59` 都声明了这一点，但它现在是**每次重启都发生**，不是理论风险 |
-| 5 | **已批准的策略版本与补丁** | `InMemoryEvolutionStore`（`pipeline.py:193`） | **全丢** | ❌ **不可接受**：审批过的策略改进在重启后**静默回退**到 `config/routing.policy.yaml` 的内容（全仓无写回文件，已核对）。用户会认为"批准了没用" |
-| 6 | **自进化的 RunLog / 待审批建议 / 拒绝率统计** | 同上 | **全丢** | ⚠️ 分析要从零重跑；`pending_count`、丢弃率归零 |
+| 1 | **任务快照**（envelope、状态、节点进度、artifacts） | `InMemoryStateStore` / `SqliteStateStore` | **全丢**（sqlite 下存活） | ⚠️ 受影响：客户端拿着 task_id 查询会 404。用户看到的是"任务凭空消失" |
+| 2 | **事件流**（SSE 重放源） | 同上（`EventBus` 建在 state 上） | **全丢**（sqlite 下存活） | ⚠️ 断线重连的 `Last-Event-ID` 重放失效，任务本身也没了，同 #1 |
+| 3 | **上传的媒体**（金融截图 blob） | `InMemoryMediaStore`（`pipeline.py:211`）——**写死，与 `state_backend` 无关** | **全丢** | ⚠️ `media_id` 变悬空引用，相关任务必然失败。常驻内存：单张上限 10 MiB（`routing.policy.yaml:427`）、缺省保留 1 天，因此**已有总字节上界**（缺省 128 MiB，实测 1:1 RSS）挡住"100 张 = 1G"那条路；**落盘持久化未做**，见下 |
+| 4 | **已发放的子令牌** | `TokenRegistry`（`app.py:144`）；sqlite 下同库一张 `issued_tokens` 表 | **全丢**（sqlite 下存活） | ❌ **不可接受**：所有子令牌持有者当场 401，必须重新发放。sqlite 后已解决（只存摘要，不存明文） |
+| 5 | **已批准的策略版本与补丁** | `InMemoryEvolutionStore` / `SqliteEvolutionStore` | **全丢**（sqlite 下存活） | ❌ **不可接受**：审批过的策略改进在重启后**静默回退**到 `config/routing.policy.yaml` 的内容。sqlite 后由 `astart()` 把 active/canary 版本读回来 |
+| 6 | **自进化的 RunLog / 待审批建议 / 拒绝率统计** | 同上 | **全丢**（sqlite 下存活） | ⚠️ 分析要从零重跑；`pending_count`、丢弃率归零 |
 | 7 | **预算账本**（`/v1/usage` 的 spent/by_user/by_tenant） | `BudgetLedger`（`budget.py:68-70`） | **清零** | ⚠️ 跨重启的用量统计不成立。且审计已记「用量统计恒 0」，本就是不完整功能（`budget.py:60` 注明持久化属 M6） |
 | 8 | **在执行的任务与其取消登记** | `Dispatcher._running` / `_cancels` | 随 #1 一起没 | ✅ 可接受：进程都没了，任务本就该失败 |
 | 9 | **画像缓存** | `evaluator._cache`（`evaluator.py:113`） | 冷启动 | ✅ 可接受：只是重算，且审计记了它无上限无 TTL（另有账） |
@@ -253,48 +252,85 @@ nginx 上对应的是 `proxy_next_upstream` 之类的重试策略：本服务是
 **#1–#3 是"任务与数据"，#4–#5 是"凭据与配置"。后两条最难受，因为它们是静默的**——
 前者用户会立刻看到 404，后者用户以为生效了其实没有。
 
-### 能不能换成持久后端？
+**#3 里"落盘"这一项仍未做**，做的是"有界"：总字节上界 + 拒绝新上传。
+理由与取舍见下一节末。
 
-能，但**当前没有开关**——这是本次检查最重要的发现，需要 PM 决策：
+### 换成持久后端：开关已接上（2026-10-08 完成）
 
-`DispatcherConfig.state_backend` 支持 `"memory"` / `"sqlite"`
-（`pipeline.py:186-203`，`SqliteStateStore` / `SqliteEvolutionStore` 都已实现
-且有测试），但：
+此前 `DispatcherConfig.state_backend` 支持 `"memory"` / `"sqlite"`，但 `Settings`
+没有这一项、`lifespan` 调 `Dispatcher.build()` 不传 config，于是
+**改 `.env` 换不了后端，生产必然跑内存实现**。现在这条链路是通的：
 
-- `Settings` 里**没有** `state_backend` 字段，`.env.example` 里**没有**这一项，
-  `lifespan` 调 `Dispatcher.build()` 时**不传 config**。
-- 也就是说：**改 `.env` 换不了后端，只能改代码**。
-- 即便换上 sqlite，**媒体仍然是 `InMemoryMediaStore`**（`pipeline.py:211`
-  是写死的构造，不看 `state_backend`）——#3 不会跟着解决。
+```
+.env  DISPATCHER_STATE_BACKEND=sqlite
+  → Settings.dispatcher_state_backend（Literal，拼错在启动即报错）
+  → lifespan 构造 DispatcherConfig
+  → Dispatcher.build() 装 SqliteStateStore + SqliteEvolutionStore
+  → Dispatcher.astart() 打开库、并把库里 active/canary 的策略版本读回来
+```
 
-因此「让状态跨重启存活」是一次**代码改动 + 测试补充**，不是配置项。
-按硬约束本轮不动业务代码，留作决策项。
+| # | 状态 | `sqlite` 之后 |
+|---|---|---|
+| 1 | 任务快照 | ✅ 存活（客户端拿 `task_id` 查询不再 404） |
+| 2 | 事件流（SSE 重放源） | ✅ 存活（`Last-Event-ID` 重放成立） |
+| 3 | 上传的媒体 | ⚠️ **仍不落盘**，但有了总字节上界（见下） |
+| 4 | 已发放的子令牌 | ✅ 存活（表在同一个库里，**只存摘要不存明文**） |
+| 5 | 已批准的策略版本/补丁 | ✅ 存活，且启动时优先于 YAML 文件 |
+| 6 | RunLog / 建议 / 拒绝率 | ✅ 存活 |
+
+**#3 为什么没有跟着做全量持久化**：金融截图落盘要同时扛住权限（`chmod 600`
+与属主）、清理（落盘的过期文件谁来删）、备份与法务留存三件事，任何一件没想清楚，
+落盘就比不落盘更危险。这一轮因此只做**有界**：总字节上界
+`DISPATCHER_MEDIA_MAX_TOTAL_BYTES`（缺省 128 MiB，超限 413 且可重试，
+不淘汰已在库里的）。缺省值有实测依据——每张 10 MiB 截图常驻 **10.00 MiB RSS**
+（载荷与 RSS 近似 1:1），因此它就是媒体那一块的 RSS 上界 ≈ 2G 的 6%。
+**媒体持久化本身仍待 PM 排期**（要实现 `MediaStorePort` 的第三个适配器）。
+
+**两道防"生产忘配"**：`.env.example` 里 `DISPATCHER_STATE_BACKEND=sqlite` 是
+写死的（部署清单就是照它 `cp`），另外启动时若后端是 `memory` 却配了
+`DISPATCHER_AUTH_TOKEN`，日志里会有一条 ERROR。**代码缺省仍是 `memory`**，
+是为了让跑测试与本地起服务不留下脏状态；测试进程里这一项被
+`tests/conftest.py` 钉死成 `memory`，所以在服务器上跑 `pytest -q` 复验
+**不会**碰到生产库。
+
+验收在 `tests/test_restart_persistence.py`：真的跑完一个 lifespan 周期、用同一个
+库文件再起一个应用，然后从 HTTP 上看子令牌还认不认、策略版本回不回退。
 
 ---
 
 ## 8. 上线前 checklist
 
 - [ ] `chmod 600 .env`，属主 `smart-dispatcher`
+- [ ] `DISPATCHER_STATE_BACKEND=sqlite` 已填（`.env.example` 里就是它；改成
+      `memory` 的话重启会丢全部子令牌与已批准的策略）
+- [ ] 库文件所在目录可写（缺省 `<仓库>/data/`，`ProtectSystem=full` 下可写；
+      指到仓库外则要加 `ReadWritePaths`，见 `deploy/smart-dispatcher.service`）
 - [ ] `DISPATCHER_AUTH_TOKEN` 已填（**留空 = 鉴权关闭**，启动日志里会有 ERROR）
 - [ ] 三个 `LLM_*_MODEL` 与 `LLM_BASE_URL` 已填，`LLM_API_KEY` 有效
-- [ ] `.venv/bin/python -m pytest -q` 在服务器上跑一遍，460 全过
-  （锁文件含 dev 依赖，这一步是可做的）
+- [ ] `.venv/bin/python -m pytest -q` 在服务器上跑一遍，498 全过
+  （锁文件含 dev 依赖，这一步是可做的；测试进程把后端钉成 `memory`，
+  不会碰生产库）
 - [ ] systemd 单元用 `--workers 1`，且 `EnvironmentFile` 指对路径
 - [ ] nginx 的 SSE 三行（`proxy_buffering off` / `proxy_read_timeout` / `chunked_transfer_encoding`）已加
-- [ ] `journalctl -u smart-dispatcher` 能看到启动那行 `smart-dispatcher 启动：{...}`，且其中**没有** `DISPATCHER_AUTH_TOKEN 未配置` 的 ERROR
+- [ ] `journalctl -u smart-dispatcher` 能看到启动那行 `smart-dispatcher 启动：{...}`，
+      其中 `state_backend` 是 `SqliteStateStore`（不是 `InMemoryStateStore`），
+      且**没有** `DISPATCHER_AUTH_TOKEN 未配置` 与那条「状态后端是 memory」的 ERROR
 - [ ] 反代侧限制请求体大小与 `/docs`、`/openapi.json` 的暴露面
-- [ ] 已和 PM 确认第 9 节的决策项，尤其是「重启丢状态」在放量前是否可接受
+- [ ] 已和 PM 确认第 9 节的决策项
 
 ---
 
 ## 9. 待 PM 决策 / 遗留
 
-1. **状态持久化（最高优先）**：见第 7 节末。要真正解决需要
-   ①把 `state_backend` 接到 `Settings`（配置项，改动小）
-   ②给媒体换持久实现（`MediaStorePort` 已有端口，缺实现）
-   ③补"重启后子令牌/策略回退"的验收方式。
-   本轮未做，因为它会改运行时行为，超出「不改业务代码」的约束。
+1. ~~**状态持久化（最高优先）**~~ —— **2026-10-08 已做**（见第 7 节末）：
+   `state_backend` 已接到 `Settings`、子令牌/策略版本/任务快照跨重启存活、
+   验收在 `tests/test_restart_persistence.py`。**仍未做的两件**：
+   - **媒体落盘持久化**：现在只有内存实现 + 总字节上界（缺省 128 MiB）。
+     要真正跨重启，得实现 `MediaStorePort` 的第三个适配器，且必须先定下
+     落盘位置/权限/过期清理/备份留存四件事。**请 PM 排期**。
+   - **预算账本持久化**（第 7 节 #7，本就在 M6 计划里）。
 2. **`Problem.detail` 未脱敏**：审计已记（「错误体泄露」），本轮未改。
+   （会改运行时行为，超出「不改业务代码」的约束，留作独立改动。）
 3. **客户端速率限制缺失**：审计表「无速率与并发限制」未做。
    反代侧的 `limit_req` 是短期缓解。
 4. **2 核 2G 的容量口径**：SSE 每个连接一个生成器 + 一个 50ms 轮询任务

@@ -123,6 +123,20 @@ ctx.config.privacy.retain_receipt_images_days
 
 清理由 `MediaStorePort.sweep_expired(now)` 周期性执行，由定时任务驱动。
 
+### 总量上界（内存实现的第二道闸）
+
+保留期只管"过期的会被清掉"，不管"没到期的会堆积"：上传了却一直没被任务引用的
+截图要躺满整个保留期（缺省 1 天）。`InMemoryMediaStore` 因此另有一个**总字节上界**
+（`DISPATCHER_MEDIA_MAX_TOTAL_BYTES`，缺省 128 MiB），超过就拒绝新上传
+（413 `media_too_large`，`retryable: true`——清理任务跑过就会把空间还回来）。
+
+**不淘汰已在库里的媒体**：淘汰会让某个 `media_id` 变成悬空引用，而等待它的任务
+必然失败——那时丢的是系统已经收下的数据。拒绝新数据只影响这一次上传。
+
+缺省值的依据是实测：每张 10 MiB 截图的常驻成本是 **10.00 MiB RSS**（载荷与 RSS
+近似 1:1），因此 128 MiB ≈ 12 张满额截图 ≈ 2G 的 6%。详见
+[12-deployment.md](12-deployment.md) 第 7 节 #3。
+
 ### 04 分析只看结构化字段
 
 自进化的分析输入是 `RunLog`，其中的 `redaction` 段**必填**：

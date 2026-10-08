@@ -53,9 +53,10 @@ Environment=PYTHONDONTWRITEBYTECODE=1
 # 默认开（Config.proxy_headers=True），而 --forwarded-allow-ips 默认
 # "127.0.0.1,::1"——只信任来自同机反代的 X-Forwarded-*，正是我们要的。
 #
-# --workers 1：**不能加**。子令牌登记簿（TokenRegistry）、任务状态
-# （InMemoryStateStore）、媒体、预算账本全在进程内存里，多 worker 会让
-# 「A 进程签发的令牌 B 进程不认」「任务提交到 A 却在 B 查不到」。
+# --workers 1：**不能加**。媒体、预算账本、在执行的任务与其取消登记、
+# 媒体保护集都还在进程内存里，多 worker 会让「任务提交到 A 却在 B 查不到」。
+# （子令牌/任务快照/策略版本在 sqlite 后端下已落库，但上面这些没有，
+#   而且库是"一个进程持有"的用法，多写者会撞 SQLITE_BUSY。）
 # 详见 docs/12-deployment.md 第 6 节的内存态清单。
 ExecStart=/opt/smart-dispatcher/.venv/bin/python -m uvicorn main:app \
     --host 127.0.0.1 \
@@ -86,11 +87,14 @@ ProtectHome=true
 ProtectSystem=full
 
 # 更严的变体（可选）：ProtectSystem=strict 会把整个文件系统挂成只读，
-# 那时必须显式放行可写目录，例如将来改用 sqlite 后端时：
+# 那时必须显式放行可写目录。**现在就用 sqlite 后端**（.env.example 里
+# DISPATCHER_STATE_BACKEND=sqlite），库文件缺省落在 /opt/smart-dispatcher/data/：
 #   ProtectSystem=strict
 #   ReadWritePaths=/opt/smart-dispatcher/data
-# 现在默认是内存后端、**不落任何盘**，因此上面的 full 已经够，且不会因为
-# 目录不存在而让服务起不来。
+# 用 full（当前值）时 /opt 仍可写，因此上面的目录不需要额外放行，也不会因为
+# 目录不存在而让服务起不来（SqliteStateStore.open 会 mkdir）。
+# 若把 DISPATCHER_STATE_PATH 指到 /var/lib/smart-dispatcher/ 之类的地方，
+# 记得先建目录并 chown smart-dispatcher，同时在 ReadWritePaths 里放行。
 
 [Install]
 WantedBy=multi-user.target
