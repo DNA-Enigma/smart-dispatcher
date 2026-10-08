@@ -28,3 +28,6 @@ logs/
 .vscode/
 *.swp
 .DS_Store
+
+# mimo 工作区临时文件
+.mimocode/
