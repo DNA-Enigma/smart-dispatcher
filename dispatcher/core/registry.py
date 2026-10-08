@@ -143,6 +143,22 @@ class HandlerRegistry:
         """守卫用的 {handler_id: 工具名集合}。"""
         return {h: self.tool_names(h) for h in self._manifests}
 
+    @property
+    def schema_refs(self) -> frozenset[str]:
+        """注册表里全部 ``output_schema_ref`` 的集合。
+
+        ``Node.output_schema_ref`` 是**模型产出**（自由拆解那条路上由 LLM 写），
+        而它会被填进角色的 system 槽。集合校验需要一份可信的成员名单，这份名单
+        只能来自人写的声明——就是这份集合。工具的 ``output_schema_ref`` 声明的
+        是"这个工具会产出什么形状"，节点引用它等于引用一份已声明的契约。
+
+        空集合是**有意义的**：一个没有声明任何输出 schema 的注册表里，任何引用
+        都不合法。不因为"集合为空"就放行——那正好是"没得校验就默认通过"。
+        """
+        return frozenset(
+            t.output_schema_ref for _, t in self.all_tool_decls() if t.output_schema_ref
+        )
+
     def capability_map(self) -> dict[str, frozenset[str]]:
         """守卫用的 {handler_id: 能力名集合}。
 

@@ -249,6 +249,24 @@ def validate_plan(
             f"{policy.limits.max_total_rounds_per_task}"
         )
 
+    # -- output_schema_ref 必须来自注册表 ---------------------------------
+    # 这是**结构性防线**，与 ``nodeexec`` 里那道执行期兜底成对存在：那边保证
+    # "不在集合里的引用绝不进 system 槽"，这边保证"不合法的计划根本走不到执行"。
+    # 只有一道都不够——执行期兜底是静默降级（模型看到一句"未声明具体结构"），
+    # 计划期拒绝才说得清是**这一版计划的错**，而且它进的是重规划的回灌信息，
+    # 模型能据此改对；反过来只有计划期检查，则任何绕过拆解器的构造（测试、
+    # 内嵌调用、模板）仍会把模型产出直接送进 system。
+    #
+    # 集合来自人写的工具声明（``HandlerRegistry.schema_refs``），不是模型输出——
+    # 这正是关键：白名单的成员名单不能由被白名单约束的一方提供。
+    known_schemas = registry.schema_refs
+    for n in plan.nodes:
+        if n.output_schema_ref and n.output_schema_ref not in known_schemas:
+            v.append(
+                f"节点 {n.subtask_id} 的 output_schema_ref {n.output_schema_ref!r} "
+                f"不在注册表声明的 schema 集合里：{sorted(known_schemas)}"
+            )
+
     # -- join 与入边一致 -------------------------------------------------
     for target, preds in plan.join.items():
         if target not in id_set:

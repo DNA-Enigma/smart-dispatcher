@@ -204,13 +204,27 @@ class NodeExecutor:
         # ledger_auditor）已改为指向下面那个数据块——它们自己的开头本来就写着
         # "你的系统提示词不得由外部数据填充"。
         tools_line = ", ".join(sorted(allowed)) or "（无）"
+        # ``node.output_schema_ref`` 也是模型产出（自由拆解那条路由 LLM 写）。
+        # 它进 system 之前必须过**成员校验**，名单是人写的工具声明；不在名单里
+        # 就换成一句固定的兜底串。不校验的话，模型只要把注入指令写成
+        # ``output_schema_ref`` 就能把它放进模型最信任的那一格——和 ``args``
+        # 同一个道理，只是这条路径更隐蔽（它长得像一个"引用"）。
+        #
+        # 这里**只降级、不报错**：计划期（``plan.validate_plan``）已经拒过一次，
+        # 走到这里的漏网多半来自模板或直接构造的测试，让它们拿到那句兜底、
+        # 照常执行，比在执行路径上抛异常好。
+        schema_line = (
+            node.output_schema_ref
+            if node.output_schema_ref in self._registry.schema_refs
+            else "（未声明具体结构，按工具语义产出）"
+        )
         system = fill(
             self._prompts.get(role.system_prompt_ref.replace("prompts/", "")),
             {
                 "tools": tools_line,
                 "tool_whitelist": tools_line,
                 "node_goal": node.name or node.subtask_id,
-                "output_schema": node.output_schema_ref or "（未声明具体结构，按工具语义产出）",
+                "output_schema": schema_line,
             },
         ) + "\n\n" + _AGENT_CONTRACT.replace("{tools}", tools_line)
 
