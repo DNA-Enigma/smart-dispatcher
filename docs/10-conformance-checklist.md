@@ -204,6 +204,9 @@ CI 检查：`dispatcher/core/**` 与 `dispatcher/stages/**` 中不得出现
       键空间按租户隔离，知道别人的 key 也拿不到别人的任务
 - [ ] `POST /v1/policy/rollback` 与 `.../suggestions/{id}/approve` 无凭据不可用，
       且审批人取自身份而非请求体
+- [ ] `POST /v1/tokens` / `GET /v1/tokens` / `DELETE /v1/tokens/{id}` **只接受主令牌**：
+      无凭据、凭据无效、以及"凭据有效但不是主令牌"都返回 `401`；鉴权关闭（未配主令牌）
+      时也不例外——不存在"无凭据即可发放"的路径
 - [ ] 自动化的：遍历路由表断言"没有一条能无凭据访问"（人手维护清单一定会漏）
 
 ### 4.1 契约机制（M1）
