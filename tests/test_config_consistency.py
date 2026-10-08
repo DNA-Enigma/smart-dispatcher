@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -378,3 +379,79 @@ def test_capability_names_use_dotted_namespace(registry):
     for cap in registry.all_capabilities():
         assert "." in cap, f"能力名 {cap} 缺少点分命名空间"
         assert cap == cap.lower(), f"能力名 {cap} 应为小写"
+
+
+# ---------------------------------------------------------------------------
+# flow_templates 的 confirmation 段 vs handler 实际抛出的确认
+# ---------------------------------------------------------------------------
+# 触发那次确认的配方：template_id → (handler_id, 工具名, 触发确认的参数)。
+#
+# 这里刻意**不写一份期望值**再比对——那会变成第三份副本，副本越多分叉越多。
+# 做法是真的把工具调一遍，拿它返回的 ``needs_confirmation.options`` 与模板声明比。
+#
+# 加了声明 ``confirmation.options`` 的模板却没在这里加配方 → 测试失败并点名，
+# 这就是防止下一次分叉的地方。
+_CONFIRMATION_TRIGGERS: dict[str, tuple[str, str, dict]] = {
+    "receipt_to_entry": (
+        "bookkeeping",
+        "build_ledger_entry",
+        # 不给 direction：handler 判不出支出还是收入时才停下来问
+        {"fields": {"amount": 38.0, "currency": "CNY"}},
+    ),
+    "schedule_parse_to_create": (
+        "calendar",
+        "create_event",
+        # ambiguous=True：解析出的时间有歧义时才停下来问
+        {"ambiguous": True, "start": "2026-10-07T15:00:00+08:00", "title": "开会"},
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    "tpl_path", sorted((Path(__file__).resolve().parents[1] / "config" / "flow_templates").glob("*.yaml")),
+    ids=lambda p: p.stem,
+)
+async def test_template_confirmation_options_match_what_the_handler_returns(
+    tpl_path: Path, registry
+):
+    """模板 ``confirmation.options`` 必须与 handler **实际抛出**的选项逐字一致。
+
+    模板的 ``confirmation`` 段**没有任何代码执行它**：它没进拆解器提示词（模板只按
+    ``template_id`` / ``applies_when`` / ``handler`` 三个字段喂给 LLM），也没进 runner。
+    它是"这一步之前会有一次人工确认"的**可读表述**——而可读表述一旦与实现各写一份，
+    就一定会分叉，这一处已经分叉过：``receipt_to_entry`` 声明 confirm/edit/cancel，
+    而 ``build_ledger_entry`` 返回 expense/income。
+
+    所以真相归**被执行的那个**（handler），本测试把它钉住：谁改了 handler 的选项
+    而忘了改模板（或反过来），这里就会红。第二个证人也在同一侧——消费端的离线降级
+    ``localClarification`` 给同一场景合成的就是 expense/income。
+    """
+    tpl = load_yaml(tpl_path)
+    declared_ids = [o["id"] for o in (tpl.get("confirmation") or {}).get("options") or []]
+    if not declared_ids:
+        pytest.skip(f"{tpl_path.name} 没有声明 confirmation.options")
+
+    trigger = _CONFIRMATION_TRIGGERS.get(tpl["template_id"])
+    assert trigger is not None, (
+        f"{tpl_path.name} 声明了 confirmation.options，但 _CONFIRMATION_TRIGGERS 里"
+        f"没有触发它的配方——请补一条，好让这条一致性继续被检查"
+    )
+    handler_id, tool, args = trigger
+    handler = registry.executable(handler_id)
+    assert handler is not None, f"handler {handler_id} 没有可执行实现"
+
+    # 走到"停下来问"那一跳就够了：它不碰账本，ctx 只需要存在
+    ctx = SimpleNamespace(clarification=None, idempotency_token="tok_test")
+    result = await getattr(handler, f"tool_{tool}")(args, ctx)
+
+    conf = result.needs_confirmation
+    assert conf is not None, (
+        f"{tpl_path.name} 声明了人工确认，但 {handler_id}.{tool} 用这组参数没有抛确认"
+        f"——配方 {args} 已经与实现脱节了"
+    )
+    actual_ids = [o["id"] for o in conf.options]
+    assert actual_ids == declared_ids, (
+        f"{tpl_path.name} 声明 {declared_ids}，而 {handler_id}.{tool} 实际返回 "
+        f"{actual_ids}。模板的 confirmation 段是**可读表述**、不是可执行配置："
+        f"以 handler 为准改模板，别让两处各写一份。"
+    )

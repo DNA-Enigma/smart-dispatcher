@@ -149,26 +149,40 @@ join:
 max_parallelism: 3
 
 # -----------------------------------------------------------------------------
-# 人工确认。这是整个模板里最要紧的一段。
+# 人工确认：**这一段必须描述 handler 真正会抛的那次确认**。
 #
-# 抽取置信度不足时**停下来问**，而不是猜一个答案写进账本。猜错的代价不是"结果不够好"，
-# 而是账目被静默污染——而且用户往往几个月后才发现。
+# 模板的 `confirmation` 段不被任何代码执行——它没进拆解器提示词（模板只按
+# template_id / applies_when / handler 三个字段喂给 LLM），也没进 runner。
+# 它是"这一步之前会发生一次人工确认"的**可读表述**，同构的说明也写在
+# schedule_parse_to_create.yaml 里。既然如此，它的正文只能来自**实现**：
+# 真正改变行为的是 handlers/bookkeeping/handler.py 的 `tool_build_ledger_entry`，
+# 它在 `direction` 不在 {expense, income} 内时返回 `ToolResult.confirm(...)`。
 #
-# 用户的每一次修改都会被记为 human_signal.edits，成为 04 最有价值的输入：
-# 它同时给出了错在哪（field）和对的是什么（to），是带真值的标注。
+# 这里此前与实现分叉过：本段声明 confirm/edit/cancel，而 handler 返回 expense/income。
+# 两处各写一份就一定会分叉，所以把真相归给 handler（被执行的那个），本段照它改写。
+# tests/test_config_consistency.py 里有一条测试逐字比对两边的 option id——谁改了
+# 一边而忘了另一边，测试会红。
+#
+# 为什么这次确认要紧：猜错方向等于把账记反（收入记成支出），而用户很难发现。
+# 置信度那条（`requires_confirmation_below_confidence`）是**另一件事**：它是给拆解器
+# LLM 的提示词指令（渲染见 dispatcher/core/prompts.py），不是运行时的强制确认，
+# 因此不在这段的管辖内——这里不替它声明一次并不存在的确认。
 # -----------------------------------------------------------------------------
 confirmation:
   insert_before: write
-  on_condition: extract.confidence < routes[vision_extract_then_write].requires_confirmation_below_confidence
-  question_template: "从这张图里读到：{amount} {currency}，{merchant}，{category}。确认入账吗？"
+  # 触发条件如实照抄 handler 的判定：不只是 null，**任何判不出的值**都算。
+  on_condition: 'extract.direction not in {expense, income}'
+  question_template: "这笔 {amount} {currency} 是支出还是收入？"
   options:
-    - { id: confirm, label: 确认 }
-    - { id: edit, label: 改一下 }
-    - { id: cancel, label: 不入账 }
+    - { id: expense, label: 支出 }
+    - { id: income, label: 收入 }
   blocking: true
   # 答复后的分支：
-  #   confirm → 直接继续；
-  #   edit    → 把修改合并回 extract 的输出再继续；
-  #   cancel  → 任务以 cancelled 结束，且**不执行** write。
+  #   expense / income → 方向补齐，节点重跑一次并落成凭证；
+  #   cancel           → 任务以 cancelled 结束。它由**调度层**处理
+  #                      （ClarificationAnswer.is_cancel 认 answer_id == "cancel"），
+  #                      因此不必出现在上面的 options 里也照样有效；
+  #   要改字段          → 客户端把修改放进 clarify 的 edits（按节点 id 覆盖
+  #                      extract 的产出），handler 的这次确认不提供 edit 选项。
   # 超时未答复按 blocking=false 处理：任务停在 awaiting_clarification，不自动入账。
   on_timeout: stay_pending
