@@ -6,17 +6,30 @@
 **它不做的事情值得写下来**：不落盘、不跨进程、重启即失。所以它只适合
 "媒体活不过一次任务"的默认策略（``media_retained: false``）——那恰好是金融截图
 的默认行为。
+
+**总量有上界**（``max_total_bytes``）。保留期只管"过期的会被清掉"，不管
+"没到期的会堆积"：上传了却一直没被任务引用的截图要躺满整个保留期（缺省 1 天），
+而 ``expires_at=None`` 那条路已经被堵上之后，剩下唯一的失控方向就是量。
+实测每张 10 MiB 截图的常驻成本是 **10.00 MiB RSS**（载荷与 RSS 近似 1:1），
+因此"不限总量"在 2G 机器上就等于"100 张截图把机器撑爆"。超过上界时**拒绝入库**
+（413 ``media_too_large``），不淘汰已在库里的——淘汰会静默让某个 ``media_id``
+变成悬空引用，而那条链路上等待它的任务必然失败；拒绝新数据则只影响这一次上传，
+调用方当场拿到可重试的错误。清理过期媒体仍由 ``sweep_expired`` 负责，
+两者配合才构成"有界"：过期释放空间，超量当场拒绝。
 """
 
 from __future__ import annotations
 
 import hashlib
+import logging
 import uuid
 from collections.abc import Collection
 from datetime import UTC, datetime, timedelta
 
 from ..core.errors import DispatcherError
 from ..ports.media import MediaKind, MediaRecord
+
+log = logging.getLogger("dispatcher")
 
 _KIND_BY_PREFIX: tuple[tuple[str, MediaKind], ...] = (
     ("image/", "image"),
@@ -34,15 +47,28 @@ def _kind_of(mime: str) -> MediaKind:
 
 class InMemoryMediaStore:
     def __init__(
-        self, *, allowed_mime: list[str], max_bytes: int, default_retain_days: int = 1
+        self,
+        *,
+        allowed_mime: list[str],
+        max_bytes: int,
+        default_retain_days: int = 1,
+        max_total_bytes: int | None = None,
     ) -> None:
         self._allowed = frozenset(allowed_mime)
         self._max_bytes = max_bytes
         # 缺省保留期，来自 Settings。下界 1 是刻意的：``expires_at=None``
         # （永不过期）是"金融截图常驻内存"那条路，不能靠配置把它打开。
         self._default_retain_days = max(1, default_retain_days)
+        # ``None``/0/负数 = 不限总量。缺省不限是给**直接构造**的调用方（测试、
+        # 嵌入式用法）留的：生产走 ``Dispatcher.build()``，它会显式传入
+        # Settings 里的上界，那条路有测试钉住。
+        self._max_total = max_total_bytes if max_total_bytes and max_total_bytes > 0 else None
         self._blobs: dict[str, bytes] = {}
         self._records: dict[str, MediaRecord] = {}
+        # 单独记账而不是每次 sum(len(b) for b in self._blobs.values())：
+        # 上界一旦生效，这个值就在**上传路径**上，而上传路径每次都全量求和
+        # 是把一个 O(n) 扫描放进按字节计费的入口。
+        self._total_bytes = 0
 
     # ------------------------------------------------------------------
     async def put(
@@ -61,6 +87,26 @@ class InMemoryMediaStore:
                 "media_too_large",
                 f"媒体 {len(data)} 字节，超过上限 {self._max_bytes}",
                 context={"bytes": len(data), "max_bytes": self._max_bytes},
+            )
+        # 总量上界。单张的上限与总量的上限是两件事：前者约束"一张图多大"，
+        # 后者约束"这个进程总共持有多少"——只有后者能挡住"100 张合规的图"。
+        if self._max_total is not None and self._total_bytes + len(data) > self._max_total:
+            log.warning(
+                "媒体存储已满：已持有 %d 字节，本次 %d 字节，上界 %d 字节",
+                self._total_bytes, len(data), self._max_total,
+            )
+            raise DispatcherError(
+                "media_too_large",
+                f"媒体存储已满（已持有 {self._total_bytes} 字节 + 本次 {len(data)}"
+                f" 字节 > 上界 {self._max_total}）。过期媒体会被定时清理，请稍后重试。",
+                # 与单张超限不同，这一条**确实**会因为再试一次而好起来：
+                # 清理任务是周期跑的（缺省 300s），空间会自己还回来。
+                retryable=True,
+                context={
+                    "held_bytes": self._total_bytes,
+                    "incoming_bytes": len(data),
+                    "max_total_bytes": self._max_total,
+                },
             )
         now = datetime.now(UTC)
         # 缺省与 0 都落到配置的缺省保留期：**每个记录都必须有 expires_at**
@@ -94,6 +140,7 @@ class InMemoryMediaStore:
         )
         self._blobs[mid] = data
         self._records[mid] = rec
+        self._total_bytes += len(data)
         return rec
 
     async def get(self, media_id: str) -> tuple[bytes, MediaRecord] | None:
@@ -110,7 +157,12 @@ class InMemoryMediaStore:
         return self._records.get(media_id)
 
     async def delete(self, media_id: str) -> bool:
-        self._blobs.pop(media_id, None)
+        # 记账必须与 blob 同生共死：漏减一次，上界就单向漂移——库是空的，
+        # 而存储认为它满了，此后所有上传都被拒。取出的就是被删掉的那个对象，
+        # 不依赖 records 里还在（两者本应一致，但记账只信真正取到的那份）。
+        blob = self._blobs.pop(media_id, None)
+        if blob is not None:
+            self._total_bytes -= len(blob)
         return self._records.pop(media_id, None) is not None
 
     async def sweep_expired(self, now: datetime, *, protected: Collection[str] = ()) -> int:
@@ -126,6 +178,11 @@ class InMemoryMediaStore:
     # -- 供测试与自省 ------------------------------------------------
     def __len__(self) -> int:
         return len(self._records)
+
+    @property
+    def total_bytes(self) -> int:
+        """当前持有的载荷字节数。上界的实际值，供测试与自省读取。"""
+        return self._total_bytes
 
 
 __all__ = ["InMemoryMediaStore"]

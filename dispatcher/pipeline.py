@@ -212,6 +212,7 @@ class Dispatcher:
                 allowed_mime=policy.limits.media.allowed_mime,
                 max_bytes=policy.limits.media.max_bytes,
                 default_retain_days=cfg.settings.dispatcher_media_retain_days,
+                max_total_bytes=cfg.settings.dispatcher_media_max_total_bytes,
             ),
             state=state,
             taxonomy=taxonomy,

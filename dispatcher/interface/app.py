@@ -22,6 +22,7 @@ from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+from ..adapters.sqlite_tokens import SqliteTokenStore
 from ..core.contract import Identity, TaskEnvelope, wire_dump
 from ..core.errors import DispatcherError
 from ..core.events import TERMINAL_EVENTS, to_sse, to_sse_heartbeat
@@ -111,6 +112,15 @@ async def lifespan(app: FastAPI):
     )
     # 打开状态库、恢复库里的生效策略。必须在开放请求之前完成。
     await _dispatcher.astart()
+    # 令牌登记簿也要接上同一个库，否则重启后已发放的子令牌全部认不出来
+    # （docs/12-deployment.md 第 7 节 #4：持有者当场 401，P2-c 的功能白做）。
+    # 挂在这里而不是 create_app：应用可以在 import 期就被构造出来，而那时
+    # 不该去碰磁盘；lifespan 才是 I/O 该发生的地方。
+    token_store: SqliteTokenStore | None = None
+    if settings.dispatcher_state_backend == "sqlite":
+        token_store = SqliteTokenStore(settings.state_db_path)
+        app.state.tokens.attach_store(token_store)
+        log.info("已载入已发放令牌 %d 枚", len(app.state.tokens.records()))
     if (
         settings.dispatcher_state_backend == "memory"
         and settings.dispatcher_auth_token
@@ -136,6 +146,8 @@ async def lifespan(app: FastAPI):
         await asyncio.gather(sweeper, return_exceptions=True)
         await _dispatcher.aclose()
         _dispatcher = None
+        if token_store is not None:
+            token_store.close()
 
 
 def create_app(*, auth: AuthConfig | None = None) -> FastAPI:
