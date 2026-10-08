@@ -33,7 +33,12 @@ def problem_response(
     if exc.retry_after_ms:
         headers["Retry-After"] = str(max(1, exc.retry_after_ms // 1000))
     if exc.internal:
-        log.warning("问题 %s（内部：%s）", exc.code, exc.internal)
+        # ``internal`` 是"细节留在服务端"的落点（如供应商错误体原文）：
+        # 它**不进响应体**，但必须和响应里的 ``request_id`` 对上号，否则线上排查
+        # 只能靠时间猜。第一次把 request_id 拼进这条日志就是为了这件事。
+        log.warning(
+            "问题 %s request_id=%s（内部：%s）", exc.code, request_id or "-", exc.internal
+        )
     return JSONResponse(
         status_code=exc.status,
         content=exc.to_problem(request_id),

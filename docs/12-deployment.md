@@ -204,14 +204,34 @@ server {
 | 日志里打账单内容？ | **基本否**，有一处需留意：`openai_compat.py:337` 在 JSON 解析失败时以 WARNING 打印模型原始响应**前 800 字符**。那是模型输出（计划/决策 JSON），不是用户账单；但模型若把 prompt 里的内容原样吐回来，就会顺着这条落到日志里。排障必需，暂保留 |
 | 密钥脱敏覆盖面 | `redact_secrets`（`settings.py:151`）按**值**抹除，已用在任务快照 notes（`state.py:219`）与计划 notes（`decomposer.py:521`），有测试（`tests/test_stage_notes.py:202`） |
 | 启动日志含密钥？ | **否**。`describe_config`（`pipeline.py:1056`）只打版本号、档位名、路由 id，不含 `secret://` 引用值 |
-| 响应体含密钥？ | 见下方遗留项 |
+| 响应体含密钥/上游错误体？ | **否**（见下） |
 
-**一处已知缺口**（审计已记，本轮未改）：`Problem.detail` **未经**脱敏，
-而 `detail` 会带上供应商响应体前 300 字（`openai_compat.py:225`）。
-若供应商把请求头（含 `Authorization: Bearer <LLM_API_KEY>`）回显在错误体里，
-密钥值会出现在**给客户端的响应体**中。客户端本来就有自己的 key，
-所以不是第三方泄露，但它会进客户端日志/崩溃上报。
-审计原文列在「错误体泄露」，状态未做——**不在本轮范围，留给 PM 排期**。
+**上游错误体不再进 `Problem.detail`（2026-10-08 收口）**。此前
+`openai_compat._http_error` 把供应商响应体前 300 字拼进错误消息，而那条消息顺着
+`str(e)` → `Problem.detail` → 任务快照一路回到客户端（审计「错误体泄露」）。
+供应商回显请求头时，`Authorization: Bearer <LLM_API_KEY>` 就会出现在**给客户端的
+响应体**里。
+
+改法是**从源头切**，而不是在渲染处擦：`message` 只保留本方写的**分类文案**
+（如「凭证被拒（401）」「供应商 500（服务端错误）」），上游原文改放
+`LLMError.provider_detail`，且**先过 `redact_secrets`**（按值抹掉回显的密钥）。
+`provider_detail` 经 `to_dispatcher_error()` 落到 `DispatcherError.internal`——
+那个字段只被日志打印、**不进 Problem 体**，所以「细节留在服务端」与「响应里只留
+`request_id`」两件事同时成立。
+
+为什么从源头切：`str(LLMError)` 会被多处再加工（阶段 notes、节点失败消息、
+`direct.py` 的直答失败、handler 冒泡到 `runner` 的未包装异常），逐处脱敏必然会漏
+一处。让 `str(e)` 本身安全，所有下游自动安全。四个出口各补一条带相关 id 的日志
+（`problems.py` 带 `request_id`、`pipeline.py` 带 `task_id`+`request_id`、
+`nodeexec.py`/`runner.py` 带 `task_id`+`subtask_id`），排障不断。
+`resolve_secret` 的 422 detail 也去掉了仓库绝对路径（保留环境变量名——那才是
+可行动的线索且不含秘密）。
+
+验收：`tests/test_llm_adapter.py`（每个状态码的 message 都不得含原文 +
+`provider_detail` 已脱敏 + 网络异常原文只进 `provider_detail`）、
+`tests/test_pipeline.py`（端到端：走完整流水线的致命上游错误，`detail` 干净、
+`internal` 持原文、渲染出的 Problem 无 `internal` 字段）、
+`tests/test_problem_rendering.py`（`internal` 进日志且与响应同 `request_id`）。
 
 日志保留策略交给 journald（`SystemMaxUse=` 之类），不需要应用侧干预。
 
@@ -354,8 +374,12 @@ nginx 上对应的是 `proxy_next_upstream` 之类的重试策略：本服务是
      要真正跨重启，得实现 `MediaStorePort` 的第三个适配器，且必须先定下
      落盘位置/权限/过期清理/备份留存四件事。**请 PM 排期**。
    - **预算账本持久化**（第 7 节 #7，本就在 M6 计划里）。
-2. **`Problem.detail` 未脱敏**：审计已记（「错误体泄露」），本轮未改。
-   （会改运行时行为，超出「不改业务代码」的约束，留作独立改动。）
+2. ~~**`Problem.detail` 未脱敏**~~ —— **2026-10-08 已做**（见第 5 节末）：
+   上游错误体只进 `provider_detail`/`internal`（服务端日志），`Problem.detail`
+   只留分类文案，`request_id` 供对号。**仍遗留**：handler 自己抛出的
+   非 LLM 异常，其 `str(e)` 仍是节点失败消息（`runner.py`）——那属于"本仓代码的
+   异常"而非上游错误体，本轮未动；只有从 LLM 端口冒上来的 `provider_detail`
+   会进日志。
 3. **客户端速率限制缺失**：审计表「无速率与并发限制」未做。
    反代侧的 `limit_req` 是短期缓解。
 4. **2 核 2G 的容量口径**：SSE 每个连接一个生成器 + 一个 50ms 轮询任务

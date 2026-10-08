@@ -104,6 +104,11 @@ class LLMError(Exception):
 
     这个区分不是想出来的——是把适配器接到真实供应商、拿到一个 402 余额不足
     之后才补上的：当时的实现会把它当成上游抖动降级掉。
+
+    **``message`` 必须是本方写的分类文案，绝不拼进供应商的原始响应体。**
+    它顺着 ``to_dispatcher_error()`` → ``Problem.detail`` → 任务快照一路回到客户端
+    （审计项「错误体泄露」）。上游原文放在 ``provider_detail``：那个字段只进服务端
+    日志与异常对象，用来排障，不对外。
     """
 
     FATAL_KINDS = frozenset({"auth", "quota", "bad_request"})
@@ -115,11 +120,15 @@ class LLMError(Exception):
         retryable: bool = True,
         status: int | None = None,
         kind: str = "transient",
+        provider_detail: str | None = None,
     ) -> None:
         super().__init__(message)
         self.retryable = retryable
         self.status = status
         self.kind = kind
+        # 上游错误体（或网络异常原文）的截断副本，**仅供服务端排障**。
+        # 构造方负责先过 ``redact_secrets``，免得把回显的密钥写进日志。
+        self.provider_detail = provider_detail
 
     @property
     def fatal(self) -> bool:
@@ -142,6 +151,9 @@ class LLMError(Exception):
             detail,
             retryable=False,
             context={"provider_status": self.status, "kind": self.kind},
+            # 上游原文进 ``internal``：它只被日志打印、不进 Problem 体，
+            # 于是"细节留在服务端、request_id 在响应里"这两件事同时成立。
+            internal=self.provider_detail,
         )
 
 

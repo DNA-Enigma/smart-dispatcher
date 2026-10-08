@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from typing import Any
 
 from .agents import AgentRole, AgentSpec
@@ -30,6 +31,8 @@ from .pricing import Pricing
 from .prompts import PromptLibrary, data_block, fill
 from .registry import HandlerRegistry
 from .state import TaskRecord
+
+log = logging.getLogger("dispatcher")
 
 # Agent 每一轮必须输出的形状。用封闭的三分支而不是自由文本：
 # 自由文本没法判定"它做完了没有"，而"做完了没有"正是循环的终止条件。
@@ -270,6 +273,16 @@ class NodeExecutor:
                     note=f"agent:{node.role}",
                 )
             except Exception as e:
+                # 上游原文（``LLMError.provider_detail``）不进 ``str(e)``，因而不会
+                # 顺着节点失败消息回到客户端；但排障要靠它，所以在这里补一条带
+                # task/subtask 的日志。没有这一条，节点级上游失败的服务端只剩一句
+                # 分类文案，排查时无从下手。
+                provider_detail = getattr(e, "provider_detail", None)
+                if provider_detail:
+                    log.warning(
+                        "上游调用失败 task=%s subtask=%s（原文：%s）",
+                        ctx.task_id, node.subtask_id, provider_detail,
+                    )
                 return ToolResult.fail("upstream_llm_error", str(e), retryable=True)
 
             calls = raw.get("tool_calls") or []

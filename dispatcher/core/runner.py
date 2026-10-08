@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from collections.abc import Awaitable
 from dataclasses import dataclass, field
@@ -29,6 +30,8 @@ from .cancel import CancellationToken, Cancelled
 from .eventbus import EventBus
 from .execution import ToolResult
 from .plan import ExecutionPlan, Node
+
+log = logging.getLogger("dispatcher")
 
 # 节点终态：算出进度时只数这些
 TERMINAL_NODE_STATUS = frozenset(
@@ -257,6 +260,16 @@ class DagRunner:
                     # 执行者抛了未包装的异常：包成有类型的失败。
                     # 让它冒泡出去会让 TaskGroup 变成一堆嵌套异常组，
                     # 而事件流里只会留下一个"任务挂了"——那不叫可观测。
+                    #
+                    # 若这个异常是从 LLM 端口冒上来的（handler 直接调 ctx.llm 而
+                    # 没接住 LLMError），供应商原文在 ``provider_detail`` 里；它不进
+                    # ``str(e)``，因此不会随节点失败消息回客户端，只在这里进日志。
+                    provider_detail = getattr(e, "provider_detail", None)
+                    if provider_detail:
+                        log.warning(
+                            "节点 %s 未包装异常 task=%s（上游原文：%s）",
+                            sid, task_id, provider_detail,
+                        )
                     result = ToolResult.fail("handler_error", str(e), retryable=False)
 
                 run.attempts = executions

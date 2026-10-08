@@ -862,6 +862,14 @@ class Dispatcher:
             # 有类型的失败**不吞**。配置错误、无能力匹配这类问题重试与降级都没用，
             # 它们必须让调用方看见（见 core/errors.py 的 fatal 说明）。
             record.status = "rejected" if e.fatal else "failed"
+            # 细节（如供应商错误体原文）留在服务端：``to_problem`` 只取
+            # 契约允许的字段，``internal`` 不进快照。这里补一条带 task_id/request_id
+            # 的日志，让快照里的 request_id 能对上原文——否则异步任务的原文无处可寻。
+            if e.internal:
+                log.warning(
+                    "任务 %s request_id=%s 失败 %s（内部：%s）",
+                    task_id, record.request_id or "-", e.code, e.internal,
+                )
             record.error = e.to_problem(record.request_id)
             # 失败路径上同样要带阶段备注：降级与回退的原因只在这里
             # （"评估器全部尝试失败，使用兜底画像"），只给一个 code 与一句话，

@@ -136,6 +136,7 @@ class DirectAnswerer:
             raise DispatcherError(
                 "upstream_llm_error", str(e), retryable=True,
                 context={"provider_status": e.status, "kind": e.kind},
+                internal=e.provider_detail,
             ) from e
 
         if budget is not None and self._pricing is not None:

@@ -340,6 +340,45 @@ async def test_credential_failure_fails_loudly_instead_of_degrading(policy, pric
     assert "充值" in ei.value.detail or "余额" in ei.value.detail
 
 
+async def test_fatal_upstream_error_keeps_the_provider_body_out_of_the_problem(
+    policy, pricing, taxonomy, registry, prompts, media
+):
+    """端到端：供应商错误体不再出现在 ``Problem.detail`` 里。
+
+    审计「错误体泄露」：``resp.text[:300]`` 原样回客户端。这里让走完整流水线的
+    一次失败带上"什么都含"的原文，断言它只在 ``internal``（服务端日志/异常对象），
+    不在 ``detail``，也不在渲染出来的 Problem 实例里（契约没有 ``internal`` 字段）。
+    """
+    leaky = "host=api.internal.example.com model=vendor-x key=sk-live-abc123"
+    llm = ScriptedLLM([], fail_with=LLMError(
+        "账户余额或配额不足（402）", retryable=False, status=402, kind="quota",
+        provider_detail=leaky,
+    ))
+    d = build(policy, pricing, taxonomy, registry, prompts, media, llm)
+    with pytest.raises(DispatcherError) as ei:
+        await d.submit(text_envelope())
+
+    for leak in ("api.internal.example.com", "vendor-x", "sk-live-abc123"):
+        assert leak not in ei.value.detail
+    assert ei.value.internal == leaky, "原文必须留在服务端，否则排障断了"
+    assert "internal" not in ei.value.to_problem("rid")
+
+
+def test_missing_key_detail_carries_no_absolute_path(settings, monkeypatch, repo_root):
+    """密钥没配的 422 detail 不含仓库绝对路径（审计：带绝对路径/.env 路径）。
+
+    环境变量名要留——它才是可行动的那条线索，且本身不是秘密。
+    """
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    s = settings.model_copy(update={"llm_api_key": ""})
+    with pytest.raises(DispatcherError) as ei:
+        s.resolve_secret("secret://llm/api_key")
+    assert ei.value.code == "policy_violation"
+    assert "LLM_API_KEY" in ei.value.detail
+    assert str(repo_root) not in ei.value.detail
+    assert ".env" in ei.value.detail
+
+
 async def test_transient_failure_still_degrades(policy, pricing, taxonomy,
                                                registry, prompts, media):
     """上游抖动仍然降级——区分就在这里：抖动会好，凭证问题不会。"""

@@ -175,10 +175,14 @@ class Settings(BaseSettings):
         env_name = f"{m['group']}_{m['key']}".upper()
         value = os.environ.get(env_name) or getattr(self, env_name.lower(), "")
         if not value:
+            # detail 会以 422 回客户端（这条是 fatal）。**不含仓库绝对路径**：
+            # 文件系统布局不是排障必需的，却是"服务器上怎么部署的"这类信息
+            # （审计：密钥解析失败的 detail 带绝对路径/.env 路径）。
+            # 环境变量名保留——它才是可行动的那条线索，且本身不含秘密。
             raise DispatcherError(
                 "policy_violation",
                 f"密钥引用 {ref} 解析到环境变量 {env_name}，但它为空。"
-                f"请填好 {REPO_ROOT / '.env'}（该文件已被 .gitignore 忽略）。",
+                f"请在部署的 .env 中填好该变量（.env 已被 .gitignore 忽略）。",
                 context={"ref": ref, "env_var": env_name},
             )
         return str(value)

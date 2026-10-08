@@ -26,7 +26,7 @@ import httpx
 
 from ..core.errors import DispatcherError
 from ..core.policy import Policy
-from ..core.settings import Settings
+from ..core.settings import Settings, redact_secrets
 from ..ports.llm import LLMError, LLMMessage, LLMResult
 
 log = logging.getLogger(__name__)
@@ -191,15 +191,21 @@ class OpenAICompatibleLLM:
                 # 300ms 超了还是 30s 超了——而那决定了该改超时还是该查上游。
                 # `e or "..."` 是错的：异常对象恒为真，所以那个兜底永远不会生效，
                 # 而 httpx 的超时异常 str() 常常是空串——于是 detail 停在冒号后面什么都没有。
-                # 排查时最缺的就是这一句，必须真的兜住。
+                # httpx 的原文改走 ``provider_detail``（只进日志）：它可能带主机名/URL，
+                # 而 message 会一路回到客户端（审计「错误体泄露」）。
                 reason = str(e).strip() or "上游未给出原因（连接超时/读超时都可能走到这里）"
                 last = LLMError(
                     f"请求超时（{timeout if timeout else self._settings.llm_request_timeout_s}s，"
-                    f"档位 {tier}）：{reason}",
+                    f"档位 {tier}）",
                     retryable=True, kind="transient",
+                    provider_detail=redact_secrets(reason),
                 )
             except httpx.HTTPError as e:
-                last = LLMError(f"网络错误：{e}", retryable=True, kind="transient")
+                # ``{e}`` 里可能带请求 URL/主机名，同样只进 provider_detail。
+                last = LLMError(
+                    "网络错误（无法连接到模型供应商）", retryable=True, kind="transient",
+                    provider_detail=redact_secrets(str(e).strip() or "上游未给出原因"),
+                )
             else:
                 if resp.status_code >= 400:
                     last = self._http_error(resp)
@@ -221,28 +227,38 @@ class OpenAICompatibleLLM:
         系统就会在密钥已失效的情况下继续安静地产出兜底结果。
 
         429 与 5xx 是抖动，重试有意义。
+
+        **供应商响应体不进 ``message``。** 它可能带主机名、URL、模型名、key 片段、
+        账单内容，而 ``message`` 会顺着 ``str(e)`` → ``Problem.detail`` → 任务快照
+        回到客户端（审计「错误体泄露」）。原文截 300 字放进 ``provider_detail``：
+        只被服务端日志与异常对象持有，并先过 ``redact_secrets``——供应商回显请求头
+        （含 ``Authorization``）并不罕见。
         """
-        detail = resp.text[:300]
+        detail = redact_secrets(resp.text[:300])
         code = resp.status_code
         if code in (401, 403):
             return LLMError(
-                f"凭证被拒（{code}）：{detail}", retryable=False, status=code, kind="auth"
+                f"凭证被拒（{code}）", retryable=False, status=code, kind="auth",
+                provider_detail=detail,
             )
         if code == 402:
             return LLMError(
-                f"账户余额或配额不足（{code}）：{detail}",
-                retryable=False, status=code, kind="quota",
+                f"账户余额或配额不足（{code}）",
+                retryable=False, status=code, kind="quota", provider_detail=detail,
             )
         if code == 429:
             return LLMError(
-                f"供应商限流（{code}）：{detail}", retryable=True, status=code, kind="transient"
+                f"供应商限流（{code}）", retryable=True, status=code, kind="transient",
+                provider_detail=detail,
             )
         if code >= 500:
             return LLMError(
-                f"供应商 {code}：{detail}", retryable=True, status=code, kind="transient"
+                f"供应商 {code}（服务端错误）", retryable=True, status=code,
+                kind="transient", provider_detail=detail,
             )
         return LLMError(
-            f"供应商 {code}：{detail}", retryable=False, status=code, kind="bad_request"
+            f"供应商 {code}（请求被拒）", retryable=False, status=code,
+            kind="bad_request", provider_detail=detail,
         )
 
     # ------------------------------------------------------------------

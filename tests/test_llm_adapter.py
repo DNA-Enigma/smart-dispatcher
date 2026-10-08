@@ -7,12 +7,21 @@
 from __future__ import annotations
 
 import time
+from types import SimpleNamespace
 
 import httpx
 import pytest
 
 from dispatcher.adapters.openai_compat import OpenAICompatibleLLM, QPSLimiter
-from dispatcher.ports.llm import LLMError
+from dispatcher.ports.llm import LLMError, LLMMessage
+
+# 一份"什么都带"的供应商错误体：主机名、URL、模型名、key 片段、账单内容。
+# 审计「错误体泄露」说的就是它——曾以 ``resp.text[:300]`` 原样回客户端。
+_LEAKY_BODY = (
+    '{"error":{"message":"cannot reach https://api.internal.example.com/v1",'
+    '"model":"vendor-model-x","key":"sk-live-abc123","balance_cny":42.5}}'
+)
+_LEAKS = ("api.internal.example.com", "vendor-model-x", "sk-live-abc123", "balance_cny")
 
 
 def _resp(status: int, body: str = "{}") -> httpx.Response:
@@ -61,6 +70,70 @@ def test_fatal_error_translates_to_a_typed_problem_with_advice():
 
     auth = LLMError("凭证被拒", retryable=False, status=401, kind="auth")
     assert "LLM_API_KEY" in auth.to_dispatcher_error().detail
+
+
+# ---------------------------------------------------------------------------
+# 错误体泄露：供应商原文只进 provider_detail（服务端），绝不进 message
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("status", [400, 401, 402, 429, 500, 503])
+def test_provider_body_stays_out_of_the_message_for_every_status(status):
+    """message 会顺着 ``str(e)`` → ``Problem.detail`` → 任务快照回到客户端。
+
+    所以供应商响应体一个字符都不能进 message——无论哪个状态码。
+    """
+    err = OpenAICompatibleLLM._http_error(_resp(status, _LEAKY_BODY))
+    for leak in _LEAKS:
+        assert leak not in str(err), f"{status}：{leak} 漏进了 message"
+    assert err.provider_detail is not None, "原文必须留在服务端，否则排障断了"
+
+
+def test_provider_body_is_redacted_and_reaches_the_translated_problem_only_as_internal(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """``provider_detail`` 里回显的 key 已按值脱敏，并从 ``internal`` 带走。
+
+    ``internal`` 是"细节留在服务端"的落点：它不进 Problem 体，只被日志打印。
+    """
+    import dispatcher.core.settings as settings_mod
+
+    monkeypatch.setattr(
+        settings_mod, "get_settings",
+        lambda: SimpleNamespace(llm_api_key="sk-live-abc123"),
+    )
+    err = OpenAICompatibleLLM._http_error(_resp(500, _LEAKY_BODY))
+
+    # 主机名/模型名/账单在服务端原文里是可用的排查线索
+    assert "api.internal.example.com" in err.provider_detail
+    assert "balance_cny" in err.provider_detail
+    # 但密钥不留原文（日志会被外送）
+    assert "sk-live-abc123" not in err.provider_detail
+    assert "***" in err.provider_detail
+
+    problem = err.to_dispatcher_error()
+    assert problem.internal == err.provider_detail
+    for leak in _LEAKS:
+        assert leak not in problem.detail
+
+
+async def test_network_error_hides_the_host_but_keeps_it_for_logs(policy, settings):
+    """网络异常原文可能带 URL/主机名——同样只进 provider_detail。"""
+
+    def boom(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("连接 https://api.internal.example.com/v1 失败")
+
+    llm = OpenAICompatibleLLM(policy, settings)
+    await llm.aclose()
+    llm._client = httpx.AsyncClient(transport=httpx.MockTransport(boom))
+    try:
+        with pytest.raises(LLMError) as ei:
+            await llm.complete([LLMMessage.user("hi")], tier="standard")
+    finally:
+        await llm.aclose()
+
+    err = ei.value
+    assert "api.internal.example.com" not in str(err)
+    assert "网络错误" in str(err)
+    assert "api.internal.example.com" in (err.provider_detail or "")
 
 
 # ---------------------------------------------------------------------------
