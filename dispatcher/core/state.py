@@ -18,6 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from .contract import RouteDecision, TaskProfile, TaskStatus
 from .errors import DispatcherError
 from .guard import RawDecision
+from .settings import redact_secrets
 
 
 class TaskRecord(BaseModel):
@@ -99,6 +100,25 @@ class TaskRecord(BaseModel):
             return done / len(self.node_runs)
         return 1.0 if self.status in TERMINAL_STATUSES else 0.0
 
+    def stage_notes(self) -> dict[str, list[str]]:
+        """三个阶段各自的诊断备注，按阶段分组。
+
+        ``notes`` 是"这一步为什么降级 / 回退 / 没跑成"的**唯一线索**——例如
+        "评估器全部尝试失败，使用兜底画像"、"模板 receipt_to_entry 未通过校验"。
+        它们此前只留在内部的 ``*_meta`` 里，快照与错误体都不暴露，于是外面只能
+        看到一个 ``degraded=true``，看不到原因（2026-10-08 实测：排障只能靠猜）。
+
+        分组而不是合成一个平表：同一条文案在不同阶段含义不同，而"哪一步出的问题"
+        正是排障时要回答的第一个问题。
+
+        快照与错误体**共用这一个实现**——两处各写一份一定会分叉。
+        """
+        return {
+            "evaluation": _redact_notes(self.evaluation_meta.get("notes")),
+            "routing": _redact_notes(self.route_meta.get("notes")),
+            "planning": _redact_notes(self.plan_meta.get("notes")),
+        }
+
     def to_snapshot(self) -> dict[str, Any]:
         """渲染成 ``schemas/task_snapshot.json`` 的实例。
 
@@ -135,6 +155,7 @@ class TaskRecord(BaseModel):
             },
             "clarification": self.clarification,
             "error": self.error,
+            "stage_notes": self.stage_notes(),
             "policy_version": self.policy_version,
             "created_at": self.created_at.isoformat().replace("+00:00", "Z"),
             "updated_at": self.updated_at.isoformat().replace("+00:00", "Z"),
@@ -185,6 +206,17 @@ class TaskRecord(BaseModel):
 TERMINAL_STATUSES = frozenset(
     {"succeeded", "failed", "cancelled", "budget_exceeded", "rejected"}
 )
+
+
+def _redact_notes(notes: Any) -> list[str]:
+    """把备注出快照前过一道密钥脱敏（见 ``settings.redact_secrets``）。
+
+    非列表（历史记录形状不对）一律当作"没有备注"：快照是契约的一部分，
+    一个形状不对的字段不该把渲染整条快照这件事带崩。
+    """
+    if not isinstance(notes, list):
+        return []
+    return [redact_secrets(str(n)) for n in notes]
 
 # 子任务的终态。与 runner 里的同名集合一致——两边都表示"这一步已经有结论了"。
 TERMINAL_NODE_STATUS = frozenset(

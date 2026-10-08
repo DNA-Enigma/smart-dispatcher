@@ -147,4 +147,25 @@ def get_settings() -> Settings:
     return Settings()
 
 
-__all__ = ["REPO_ROOT", "Settings", "get_settings"]
+def redact_secrets(text: str) -> str:
+    """把文本里出现过的**已解析密钥值**抹掉。
+
+    ``resolve_secret`` 的逆操作，所以放在同一处：既然密钥只从这一个地方进来，
+    往外送的文本也该只从这一个地方过一道。
+
+    用于**要出进程**的文本：任务快照的 notes、错误体的 context、日志。这些文本
+    常来自上游异常消息，而适配器会把供应商响应体原文截 300 字放进去
+    （``adapters/openai_compat.py::_http_error``）——供应商回显请求头并不罕见，
+    密钥值于是有可能顺着这条路径漏出去。
+
+    按**值**匹配替换，不猜格式：只抹掉真正在用的那个密钥，不会误伤正常的错误
+    文本。密钥的引用名（``secret://llm/api_key``）与环境变量名不抹——它们不含
+    秘密，抹掉反而让"密钥没配好"这条最需要行动的线索变得无从下手。
+    """
+    secret = get_settings().llm_api_key
+    if not secret:
+        return text
+    return text.replace(secret, "***")
+
+
+__all__ = ["REPO_ROOT", "Settings", "get_settings", "redact_secrets"]

@@ -176,6 +176,11 @@ paths:
         移动端任务看板直接渲染本响应：`status`、`progress`、`plan.nodes[].status`
         与 Flutter 侧 `TaskStatus` / `progress` / `TaskStep` 一一对应。
 
+        `stage_notes` 按阶段给出降级与回退的**原因**（如「评估器全部尝试失败，
+        使用兜底画像」）。这些备注是三类失败情形下唯一的排查线索，因此无论任务
+        成功、失败还是降级都会给出；同一条文本也会出现在失败响应的
+        `Problem.context.stage_notes` 里。schema 见 `./schemas/task_snapshot.json`。
+
         任务不属于调用方时返回 `404`（与"不存在"同码），不返回 `403`。
       parameters:
         - $ref: "#/components/parameters/TaskId"

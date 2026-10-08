@@ -807,6 +807,15 @@ class Dispatcher:
             # 它们必须让调用方看见（见 core/errors.py 的 fatal 说明）。
             record.status = "rejected" if e.fatal else "failed"
             record.error = e.to_problem(record.request_id)
+            # 失败路径上同样要带阶段备注：降级与回退的原因只在这里
+            # （"评估器全部尝试失败，使用兜底画像"），只给一个 code 与一句话，
+            # 拿到 400/422 的人看不出中间发生过什么。
+            #
+            # **异常自带的那份优先**：拆解抛错时 record.plan_meta 根本没写成，
+            # 而 DecomposeMeta.notes 随异常一起给了出来。
+            notes = record.stage_notes()
+            if any(notes.values()):
+                record.error.setdefault("context", {}).setdefault("stage_notes", notes)
             record.ended_at = datetime.now(UTC)
             await self._save(record)
             await self.events.emit(task_id, "task.failed", {"error": record.error})

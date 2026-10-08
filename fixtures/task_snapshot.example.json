@@ -128,6 +128,11 @@
   },
   "clarification": null,
   "error": null,
+  "stage_notes": {
+    "evaluation": ["画像缓存命中（请求规范化哈希一致）"],
+    "routing": [],
+    "planning": ["模板 receipt_to_entry 命中，跳过自由拆解"]
+  },
   "policy_version": "pv_2026-10-01_03",
   "created_at": "2026-10-06T12:00:00Z",
   "updated_at": "2026-10-06T12:00:03.6Z",

@@ -26,6 +26,7 @@ from ..core.policy import Policy
 from ..core.pricing import Pricing
 from ..core.prompts import PromptLibrary, data_block, fill
 from ..core.registry import HandlerRegistry
+from ..core.settings import redact_secrets
 from ..core.yamlio import load_yaml
 from ..ports.llm import LLMError, LLMMessage, LLMPort
 
@@ -510,7 +511,16 @@ class Decomposer:
             else f"拆解在 {meta.revisions} 次尝试后仍未产出合法计划：{violations}"
         )
         raise DispatcherError(
-            "policy_violation", detail, context={"violations": violations}
+            "policy_violation",
+            detail,
+            context={
+                "violations": violations,
+                # 拆解抛错时 DecomposeMeta 随异常一起消失，notes 是**唯一**的真因
+                # 载体（模板为什么不命中、哪几版没通过校验）。带上它，别让它烂在栈里。
+                "stage_notes": {
+                    "planning": [redact_secrets(str(n)) for n in meta.notes]
+                },
+            },
         )
 
     # ------------------------------------------------------------------

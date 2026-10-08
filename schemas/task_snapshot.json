@@ -125,6 +125,17 @@
     },
     "error": { "oneOf": [{ "$ref": "problem.json" }, { "type": "null" }] },
 
+    "stage_notes": {
+      "type": ["object", "null"],
+      "description": "三个阶段各自的诊断备注，按阶段分组。降级与回退的**原因**只在这里（例如『评估器全部尝试失败，使用兜底画像』）——只有 degraded=true 而没有原因，等于把排查变成猜。成功、失败、降级三条路径上都会给出，字段本身恒在。",
+      "additionalProperties": false,
+      "properties": {
+        "evaluation": { "$ref": "#/$defs/StageNotes" },
+        "routing": { "$ref": "#/$defs/StageNotes" },
+        "planning": { "$ref": "#/$defs/StageNotes" }
+      }
+    },
+
     "policy_version": { "type": ["string", "null"] },
     "created_at": { "type": "string", "format": "date-time" },
     "updated_at": { "type": "string", "format": "date-time" },
@@ -140,6 +151,11 @@
     }
   },
   "$defs": {
+    "StageNotes": {
+      "type": "array",
+      "description": "该阶段的备注，按发生顺序。空数组表示这一步没有任何要说明的事——不是『不知道』。",
+      "items": { "type": "string" }
+    },
     "Money": {
       "type": "object",
       "required": ["amount", "currency"],
