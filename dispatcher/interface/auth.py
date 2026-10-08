@@ -1,9 +1,19 @@
-"""接口鉴权：一个中间件，一处解析身份。
+"""接口鉴权：一个中间件，一处解析身份，一处决定谁能发放凭据。
 
-契约声明了全局 ``bearerAuth``（``openapi.yaml`` 的 securitySchemes），但**没有发放或
-续期令牌的端点**——令牌由消费端自己的认证体系签发，调度层只信任收到的它。
-因此参考实现只做契约承诺的那一件事：比对，然后把 ``user_id`` 与 ``tenant_id``
-从 token 侧定下来。它不建用户、不发令牌、不管刷新。
+契约声明了全局 ``bearerAuth``。P2-c 之前，凭据只有一个静态的
+``DISPATCHER_AUTH_TOKEN``，没有发放端点——单用户够用，多用户试点却无从下发：
+换一个人就得改环境变量重启。现在多了一类**已发放令牌**
+（``POST /v1/tokens``），由**主令牌**（master，即 ``DISPATCHER_AUTH_TOKEN``）
+签发给指定的 ``tenant_id``/``user_id``，登记在 :class:`~.tokens.TokenRegistry` 里。
+
+三类身份，边界很清楚：
+
+* **主令牌**：配置里的静态串，绑定 ``DISPATCHER_TENANT``/``DISPATCHER_USER``。
+  它既是这台部署所有者自己的凭据，也是**唯一的发放者**——``ADMIN_PATH_PREFIXES``
+  下的路径只认它。主令牌不进登记簿，进程重启不影响它。
+* **已发放令牌**：主令牌签发出来的，各绑定一份 tenant/user，可被 ``DELETE``
+  撤销，进程内存储（重启即全部失效——见 tokens.py）。
+* **无凭据**：只有 ``PUBLIC_PATHS`` 放行。
 
 三件事在这里收口：
 
@@ -13,12 +23,16 @@
   全仓 grep ``Depends`` 零命中，而端点有十九个）。
 * **身份**：唯一来源是 token。请求体 ``identity``、``x-tenant-id``/``x-user-id``、
   query 参数一概不再被当作事实——"客户端自报身份"与"零认证"是同一个缺陷的两半。
+* **发放权**：谁能把别人放进来的凭据发出去。**一个开放的发放端点等于零鉴权**：
+  任何人 ``POST`` 一次就拿到凭据，再把所有端点走一遍。因此 ``/v1/tokens`` 不是
+  普通受保护端点，它要求主令牌；鉴权关闭（未配主令牌）时它一律 401，不存在
+  "无凭据即可发放"的路径。
 * **开关**：``DISPATCHER_AUTH_TOKEN`` 为空 = 鉴权关闭，只用于本地开发；
   启动时由 ``create_app`` 打一条 ERROR 级日志，不做静默放行。
 
-**为什么不用 JWT**：契约没有发放端点，验签要引入新依赖与一套密钥分发，而本轮约束
-明确不引新依赖。将来消费端 IdP 上线，只需要替换 ``_verify`` 这一处——中间件以下
-的所有代码都不感知 token 长什么样。
+**为什么不用 JWT**：验签要引入新依赖与一套密钥分发，而本轮约束明确不引新依赖。
+将来消费端 IdP 上线，只需要替换 ``_resolve`` 这一处——中间件以下的所有代码都不
+感知 token 长什么样。
 """
 
 from __future__ import annotations
@@ -34,6 +48,7 @@ from ..core.contract import Identity
 from ..core.errors import DispatcherError
 from ..core.settings import Settings
 from .problems import problem_response
+from .tokens import TokenRegistry
 
 log = logging.getLogger("dispatcher")
 
@@ -42,6 +57,12 @@ log = logging.getLogger("dispatcher")
 # 是把鉴权的价值削掉一半。
 PUBLIC_PATHS: frozenset[str] = frozenset({"/v1/health"})
 
+#: 只认**主令牌**的路径前缀。按前缀而不是逐条路径：将来在 ``/v1/tokens`` 下加
+#: 端点时它自动是发放者专属，不需要有人记得往清单里补一条。这一侧的"忘记维护"
+#: 只会让端点退回普通鉴权（仍受保护），不会变成开放——与 ``PUBLIC_PATHS`` 的
+#: 失败方向相反，因此两者分开表达，合成一张表就等于把两种相反的风险混在一起。
+ADMIN_PATH_PREFIXES: frozenset[str] = frozenset({"/v1/tokens"})
+
 _IDENTITY_KEY = "identity"
 _BEARER = "bearer"
 _REALM = 'Bearer realm="smart-dispatcher"'
@@ -49,11 +70,14 @@ _REALM = 'Bearer realm="smart-dispatcher"'
 
 @dataclass(frozen=True)
 class AuthConfig:
-    """这套部署的凭据与它绑定的身份。
+    """这套部署的**主令牌**与它绑定的身份。
 
-    ``token`` 为空表示关闭鉴权。``tenant_id``/``user_id`` 是**常量身份**：
-    单 token 部署下身份就是这两个值，不为多租户抽象新模型——那是消费端
-    签发带身份的 token 之后才该做的事，而现在没有那个端点（见模块 docstring）。
+    ``token`` 为空表示关闭鉴权。``tenant_id``/``user_id`` 是主令牌的**常量身份**：
+    主令牌是部署所有者自己的凭据，身份就是这两个值。
+
+    主令牌同时是**发放者**——``/v1/tokens`` 下的端点只认它。因此这份配置不含
+    "谁能发放"的开关：配了主令牌就有人能发放，没配（鉴权关闭）就没人能发放，
+    这是同一件事的两面，多一个开关只会多一种把两者配得互相矛盾的方式。
     """
 
     token: str = ""
@@ -73,6 +97,14 @@ class AuthConfig:
         return bool(self.token)
 
 
+@dataclass(frozen=True)
+class Credential:
+    """一次通过校验的凭据：身份，以及它是不是主令牌。"""
+
+    identity: Identity
+    master: bool
+
+
 class BearerAuthMiddleware:
     """纯 ASGI 中间件。
 
@@ -81,29 +113,71 @@ class BearerAuthMiddleware:
     是移动端必需能力，不值得为了鉴权拿它冒险。
     """
 
-    def __init__(self, app: ASGIApp, *, config: AuthConfig) -> None:
+    def __init__(self, app: ASGIApp, *, config: AuthConfig, registry: TokenRegistry) -> None:
         self.app = app
         self.config = config
-        # 身份是常量，构造一次即可——每个请求重建一个 pydantic 模型没有意义。
+        self.registry = registry
+        # 主令牌身份是常量，构造一次即可——每个请求重建一个 pydantic 模型没有意义。
         self._identity = Identity(tenant_id=config.tenant_id, user_id=config.user_id)
 
+    def _resolve(self, presented: str) -> Credential | None:
+        """把一串凭据解析成身份，解析不出来就回 ``None``。
+
+        主令牌先比：它是配置里的常量串，比对是定长的（``_verify``，不看前缀、
+        不看长度差）。其余再去登记簿里按摘要查——**"不是主令牌"与"不是我们的
+        令牌"在这里是同一件事**，都回 ``None``，交给调用方按路径决定 401 的措辞。
+        """
+        if self.config.required and _verify(presented, self.config.token):
+            return Credential(self._identity, master=True)
+        issued = self.registry.resolve(presented)
+        if issued is None:
+            return None
+        return Credential(
+            Identity(tenant_id=issued.tenant_id, user_id=issued.user_id), master=False
+        )
+
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http" or scope.get("path", "") in PUBLIC_PATHS:
-            # lifespan / websocket 与公开路径直接放行。
+        if scope["type"] != "http":
+            # lifespan / websocket 直接放行。
+            await self.app(scope, receive, send)
+            return
+        path = scope.get("path", "")
+        if path in PUBLIC_PATHS:
             await self.app(scope, receive, send)
             return
 
         request = Request(scope, receive=receive)
         challenge = _REALM
-        failure: DispatcherError | None = None
+        credential: Credential | None = None
+        presented = _bearer_token(request.headers.get("authorization"))
+        if presented is not None:
+            credential = self._resolve(presented)
+            if credential is None:
+                challenge = f'{_REALM}, error="invalid_token"'
 
-        if self.config.required:
-            presented = _bearer_token(request.headers.get("authorization"))
+        failure: DispatcherError | None = None
+        if _is_admin_path(path):
+            # 发放/撤销端点只认主令牌。凭据缺失、无效、或**有效但不是主令牌**
+            # 三种情况在这里一并收口——一个能读自己任务的 token 不该能给别人发
+            # 凭据，否则权限就顺着这一跳扩散开了。
+            #
+            # 第三种给 401 而不是 403：码表（core/errors.py）里没有 403 的码，
+            # 新增码属于契约变更（与 413 复用 media_too_large 同一取舍），而
+            # RFC 6750 的 ``401 + invalid_token``（"该令牌对这里无效"）是最贴近
+            # 的可用表达。这是**已知的语义折衷**，不是"允许"。
+            if credential is None or not credential.master:
+                if credential is not None:
+                    challenge = f'{_REALM}, error="invalid_token"'
+                failure = DispatcherError(
+                    "unauthorized",
+                    "令牌的发放与撤销只接受主令牌（DISPATCHER_AUTH_TOKEN）",
+                )
+        elif self.config.required:
             if presented is None:
                 failure = DispatcherError(
                     "unauthorized", "缺少 Authorization: Bearer 凭据"
                 )
-            elif not _verify(presented, self.config.token):
+            elif credential is None:
                 challenge = f'{_REALM}, error="invalid_token"'
                 failure = DispatcherError("unauthorized", "token 无效")
 
@@ -116,8 +190,20 @@ class BearerAuthMiddleware:
             await response(scope, receive, send)
             return
 
-        scope.setdefault("state", {})[_IDENTITY_KEY] = self._identity
+        if credential is None:
+            # 鉴权关闭（未配主令牌）下的普通路径：身份仍是配置的常量，
+            # 不是客户端说了算。发放路径到不了这里（上面已 401）。
+            credential = Credential(self._identity, master=True)
+        scope.setdefault("state", {})[_IDENTITY_KEY] = credential.identity
         await self.app(scope, receive, send)
+
+
+def _is_admin_path(path: str) -> bool:
+    """路径是否落在只认主令牌的前缀下。
+
+    要求精确匹配或**斜杠边界**匹配：``/v1/tokensfoo`` 不在 ``/v1/tokens`` 下。
+    """
+    return any(path == p or path.startswith(p + "/") for p in ADMIN_PATH_PREFIXES)
 
 
 def _verify(presented: str, expected: str) -> bool:
@@ -154,4 +240,11 @@ def request_identity(request: Request) -> Identity:
     return identity
 
 
-__all__ = ["PUBLIC_PATHS", "AuthConfig", "BearerAuthMiddleware", "request_identity"]
+__all__ = [
+    "ADMIN_PATH_PREFIXES",
+    "PUBLIC_PATHS",
+    "AuthConfig",
+    "BearerAuthMiddleware",
+    "Credential",
+    "request_identity",
+]

@@ -48,6 +48,8 @@ tags:
     description: 自进化建议的列出、审批、拒绝与手动触发分析
   - name: usage
     description: 成本与用量记账
+  - name: tokens
+    description: 凭据发放与撤销（仅主令牌可用）
   - name: health
     description: 健康与依赖状态
 
@@ -855,6 +857,96 @@ paths:
                       additionalProperties: true
 
   # ===========================================================================
+  # 凭据发放
+  # ===========================================================================
+  /tokens:
+    post:
+      tags: [tokens]
+      operationId: issueToken
+      summary: 签发一枚令牌
+      description: |
+        **只接受主令牌**（部署的 `DISPATCHER_AUTH_TOKEN`），用它换一枚绑定到
+        指定 `tenant_id`/`user_id` 的子令牌。这是本契约里唯一的"把别人放进来"
+        的操作，因此它不属于普通受保护端点：
+
+        - 不带凭据、凭据无效、或凭据**有效但不是主令牌** → `401`。第三种刻意
+          不给 `403`：`problem.json` 的 `code` 是封闭词表，新增码属于契约变更，
+          而 RFC 6750 的 `401` + `invalid_token` 是"该凭据对这里无效"最贴近的
+          可用表达。**能读自己任务的人不能给别人发凭据。**
+        - 未配置主令牌（鉴权关闭）时同样 `401`：没有发放者，就没有"无凭据也能
+          发放"的路径。
+
+        返回的 `token` **只出现这一次**：服务端只保存它的 SHA-256 摘要，之后
+        列表接口再也取不回明文。丢了就撤销重发。
+
+        **不提供的**（照实声明，不是遗漏）：令牌不过期、无续期/轮换端点、
+        无密码或验证码流程、不发 refresh token。签发也不按租户限权——主令牌
+        可以为任意 tenant/user 签发，因为主令牌按定义就是部署所有者。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TokenIssueRequest"
+      responses:
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "201":
+          description: 已签发
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/IssuedToken"
+                  - type: object
+                    required: [token]
+                    properties:
+                      token:
+                        type: string
+                        description: 明文令牌。**仅此一次返回**，服务端只留摘要。
+
+    get:
+      tags: [tokens]
+      operationId: listTokens
+      summary: 列出已发放令牌
+      description: |
+        用于撤销前先看清有哪些枚。**不含明文令牌值**——那个只在签发时返回过。
+        同样只接受主令牌。
+      responses:
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "200":
+          description: 令牌列表
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/IssuedToken" }
+
+  /tokens/{token_id}:
+    delete:
+      tags: [tokens]
+      operationId: revokeToken
+      summary: 撤销一枚令牌
+      description: |
+        撤销后该令牌立即失效（下一次请求 `401`）。重复撤销同一个 id 返回 `404`
+        ——效果是幂等的（它早就不生效了），响应如实回报比假装成功更容易排查。
+        只接受主令牌。
+      parameters:
+        - name: token_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "204":
+          description: 已撤销
+
+  # ===========================================================================
   # 健康
   # ===========================================================================
   /health:
@@ -891,24 +983,27 @@ components:
       type: http
       scheme: bearer
       description: |
-        **令牌由消费端自己的认证体系签发，本契约不提供发放或续期的端点。**
+        收到 `Authorization: Bearer <token>` 后，调度层据它定下本次请求的
+        `user_id` 与 `tenant_id`。身份**只有**这一个来源。
 
-        调度层只做一件事：收到 `Authorization: Bearer <token>` 后信任它、
-        定下本次请求的 `user_id` 与 `tenant_id`。它不建用户、不发令牌、不管刷新——
-        那些属于产品，而一个通用调度层不该替产品决定用户体系长什么样。
+        两类令牌：
 
-        如果你的部署确实需要在这里签发，那是另一件事（要引入用户表、密码/验证码流程、
-        刷新策略），应当作为独立的认证服务存在，而不是塞进调度层。
+        * **主令牌**（master）：部署配置里的静态串（`DISPATCHER_AUTH_TOKEN`），
+          绑定 `DISPATCHER_TENANT` / `DISPATCHER_USER`。它既是所有者的凭据，也是
+          **唯一的发放者**——`POST /tokens`、`GET /tokens`、`DELETE /tokens/{id}`
+          只认它。
+        * **子令牌**：主令牌经 `POST /tokens` 签发，各绑定一份 tenant/user，可被
+          `DELETE /tokens/{token_id}` 撤销。
 
-        **没有 `bearerFormat`。** 此前这里声明 `bearerFormat: JWT`，而实现既不签发
-        也不解析 JWT：参考实现把整个 token 与配置的静态共享密钥做定长比对
-        （环境变量 `DISPATCHER_AUTH_TOKEN`），token 绑定哪个租户由
-        `DISPATCHER_TENANT` / `DISPATCHER_USER` 决定。`bearerFormat` 只是给客户端的
-        提示，写一个谁都不实现、也校验不出来的形状，属于"契约承诺了而实现没有"——
-        正是本次要清掉的那类不一致。
+        **不提供的**（照实声明）：不解析 JWT、没有 `bearerFormat`；子令牌不过期、
+        无续期与轮换；没有用户表、密码/验证码/找回流程——那属于产品，不属于通用
+        调度层。参考实现的子令牌存在**进程内**，因此**进程重启后所有已发子令牌
+        失效**，且多进程部署下不共享（A 发的令牌在 B 上认不出来）；跨进程要下沉到
+        存储层。
 
         校验失败一律 `401` 且响应体是 `Problem`（`code: unauthorized`），
-        并按 RFC 6750 带 `WWW-Authenticate: Bearer`。
+        并按 RFC 6750 带 `WWW-Authenticate: Bearer`。对发放/撤销端点，
+        "凭据有效但不是主令牌"同样是 `401`（码表无 `403` 的码，见该端点说明）。
 
   parameters:
     TaskId:
@@ -927,6 +1022,35 @@ components:
       schema: { type: string, maxLength: 200 }
 
   schemas:
+    TokenIssueRequest:
+      type: object
+      required: [tenant_id, user_id]
+      additionalProperties: false
+      properties:
+        tenant_id:
+          type: string
+          minLength: 1
+          description: 令牌绑定的租户。签发者（主令牌）可以为任意租户签发。
+        user_id:
+          type: string
+          minLength: 1
+          description: 令牌绑定的用户。之后该令牌的请求身份就是这两个值。
+
+    IssuedToken:
+      type: object
+      required: [token_id, tenant_id, user_id, created_at]
+      additionalProperties: false
+      description: |
+        一枚已发放令牌的**元数据**。**没有** `expires_at`：当前实现不做过期，
+        声明一个不生效的字段就是空头承诺。撤销走 `DELETE /tokens/{token_id}`。
+      properties:
+        token_id:
+          type: string
+          description: 用于撤销的标识。它不是秘密，也不是令牌本身。
+        tenant_id: { type: string }
+        user_id: { type: string }
+        created_at: { type: string, format: date-time }
+
     TaskAccepted:
       type: object
       required: [task_id, status, mode, created_at]

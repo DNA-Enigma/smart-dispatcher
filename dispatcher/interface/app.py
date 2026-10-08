@@ -34,6 +34,7 @@ from ..pipeline import Dispatcher, describe_config
 from .auth import AuthConfig, BearerAuthMiddleware, request_identity
 from .limiter import ConnectionLimiter
 from .problems import problem_response
+from .tokens import TokenIssueRequest, TokenRegistry
 from .validation import read_body, read_json_document, read_raw_body
 
 log = logging.getLogger("dispatcher")
@@ -137,8 +138,13 @@ def create_app(*, auth: AuthConfig | None = None) -> FastAPI:
         summary="评估 → 路由 → 拆解并行执行 → 自进化",
         lifespan=lifespan,
     )
+    # 已发放令牌的登记簿。按 app 实例建（不是进程级单例），与 sse_limiter 同口径：
+    # 测试里会构造多个 app，单例会让用例之间互相串味。中间件要它来认已发放令牌，
+    # 端点要它来签发/撤销，因此两个都拿同一个引用。
+    tokens = TokenRegistry()
+    app.state.tokens = tokens
     # 鉴权挂在这里，而不是逐个端点加依赖：新端点自动被保护。
-    app.add_middleware(BearerAuthMiddleware, config=auth)
+    app.add_middleware(BearerAuthMiddleware, config=auth, registry=tokens)
 
     # SSE 连接闸按 app 实例建（不是进程级单例）：测试里会构造多个 app，
     # 单例会让用例之间互相影响。挂在 state 上是为了测试能直接把它占满。
@@ -242,6 +248,49 @@ def create_app(*, auth: AuthConfig | None = None) -> FastAPI:
                 "tenant": d.ledger.tenant_total(tenant_id),
             },
         }
+
+    # ------------------------------------------------------------------
+    # 凭据发放（P2-c）
+    #
+    # 为什么放在调度层、而不是"另起一个认证服务"：试点期要的是**多用户各持一枚
+    # 凭据**，不是注册、找回密码、邮箱验证那套产品流程。把最小的一步做出来——
+    # 主令牌签发子令牌、子令牌可撤销——比现在就引入一个用户体系更贴近需求。
+    # 不做的部分（过期/续期/轮换、跨进程存储）在 openapi 里如实声明，见 tokens.py。
+    #
+    # **这三个端点只认主令牌**，由中间件的 ADMIN_PATH_PREFIXES 拦在路由之前；
+    # 端点里因此没有第二处授权判断——一处判断、一处失败，才不会有第二种行为。
+    # ------------------------------------------------------------------
+    @app.post("/v1/tokens", status_code=201)
+    async def issue_token(request: Request) -> dict[str, Any]:
+        """签发一枚绑定到指定 tenant/user 的令牌。
+
+        返回体里的 ``token`` **只在这里出现这一次**：登记簿只留它的摘要，
+        之后 ``GET /v1/tokens`` 再也拿不回明文。丢了就撤销重发。
+        """
+        body = await read_body(
+            request, TokenIssueRequest,
+            required=("tenant_id", "user_id"), endpoint="POST /v1/tokens",
+        )
+        record, token = tokens.issue(
+            tenant_id=body["tenant_id"], user_id=body["user_id"]
+        )
+        return {**record.to_wire(), "token": token}
+
+    @app.get("/v1/tokens")
+    async def list_tokens() -> dict[str, Any]:
+        """列出已发放令牌（不含明文值）。
+
+        有了它撤销才可用：否则调用方只能撤销自己在签发那一刻记下的 id，
+        而"那个人离职了，把他那枚撤掉"需要先能看见有哪些枚。
+        """
+        return {"items": [r.to_wire() for r in tokens.records()]}
+
+    @app.delete("/v1/tokens/{token_id}")
+    async def revoke_token(token_id: str) -> Response:
+        """撤销一枚令牌。撤销后它下一次请求就是 401——中间件先解析失败。"""
+        if not tokens.revoke(token_id):
+            raise DispatcherError("not_found", f"令牌不存在或已撤销：{token_id}")
+        return Response(status_code=204)
 
     # ------------------------------------------------------------------
     # 媒体

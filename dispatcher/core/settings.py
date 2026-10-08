@@ -50,12 +50,13 @@ class Settings(BaseSettings):
     llm_strong_model: str = ""
 
     # ---- 接口鉴权。----
-    # 静态共享 token。契约声明了 bearerAuth 但没有发放/续期端点（那是消费端
-    # 认证体系的事），因此参考实现只做一件事：比对。空值表示**鉴权关闭**，
-    # 只用于本地开发，启动时会打一条 ERROR 级日志。
+    # **主令牌**（master）。它有两个身份：所有者的凭据，以及唯一的**发放者**
+    # ——/v1/tokens 下的端点只认它，用来签发绑定到别的 tenant/user 的子令牌
+    # （P2-c，见 dispatcher/interface/tokens.py）。空值表示**鉴权关闭**，
+    # 只用于本地开发，启动时会打一条 ERROR 级日志；此时**没人能发放**令牌。
     dispatcher_auth_token: str = ""
-    # 这个 token 绑定到哪个租户/用户。单 token 部署下身份就是一个常量——
-    # 不为多租户抽象新模型，那是"消费端 IdP 签发带身份的 token"之后的事。
+    # 主令牌绑定到哪个租户/用户。子令牌的 tenant/user 在签发时由请求体给出，
+    # 不受这两个值约束；它们只决定主令牌自己的身份。
     dispatcher_tenant: str = "default"
     dispatcher_user: str = "owner"
 
