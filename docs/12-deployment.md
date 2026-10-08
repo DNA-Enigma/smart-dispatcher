@@ -149,11 +149,35 @@ server {
   `"127.0.0.1,::1"`），但它只影响日志里记录的客户端 IP 与 `request.url` 的 scheme；
   本服务的身份**唯一来源是 bearer token**（`dispatcher/interface/auth.py:24-27`），
   请求体/请求头里自报的 tenant/user 一律不采信。反代加的头伪造不了身份。
-- **想直接绑 `0.0.0.0` 也可以**，但那样这三件事要自己扛：HTTPS 终止、
+- **想直接绑 `0.0.0.0` 也可以**，但那样这两件事要自己扛：HTTPS 终止、
   限流（应用侧只有 LLM 的 QPS 闸，没有面向客户端的速率限制——
-  审计表里「无速率与并发限制」一项未做）、以及 `/docs` 的公网可达性。
-  用反代时 `/docs` 与 `/openapi.json` 会要求 bearer token，
-  浏览器地址栏打不开（这是审计表里已记的决策点，不是本次引入的）。
+  审计表里「无速率与并发限制」一项未做）。**`/docs` 不再是其中之一**。
+
+### 交互式文档的开关（2026-10-08 收口）
+
+审计项「`/docs`、`/openapi.json` 公网无鉴权可达」的解法在这里。此前是个两难：
+开着等于把全部 API 面（端点、参数、错误码）摊给公网扫描器；加 token 之后
+`/docs` 又因为浏览器地址栏带不了 header 而打不开。
+
+现在的规则是**一根线**：**配了主令牌 = 生产形态 → `/docs`、`/redoc`、
+`/openapi.json` 一律不挂载**（`create_app` 里 `docs_url=redoc_url=openapi_url=None`）；
+**没配令牌 = 本地开发 → 文档照常可用**。开关**不来自新环境变量**，而是复用既有的
+生产信号——`create_app` 本来就以「配没配 `DISPATCHER_AUTH_TOKEN`」判断要不要打那条
+"鉴权已关闭"的 ERROR，`lifespan` 也用它判断"像不像生产"。多一个 `DISPATCHER_DOCS=1`
+之类的开关，就是多一条"配错一行把 API 面重新敞开"的路。
+
+两点刻意的选择：
+
+- **结构上去掉路由，而不是只靠中间件拦成 401。** 拦不拦得住取决于
+  `PUBLIC_PATHS` 那张表；将来若有人把 `/docs` 加进「公开路径」，文档会当场裸露。
+  路由压根不存在，就没有这个面。没令牌的人访问 `/docs` 仍得到 401——但它与访问
+  任意陌生路径长得一模一样，探测不出"这里有个文档站"。
+- **契约不受影响。** 关掉的是**可交互浏览**，不是**声明**：`openapi.yaml` 仍是
+  完整的端点契约，`tests/test_auth_contract.py` 的一致性断言照旧全绿。
+  需要看文档时，在本机（不配令牌）起服务即可。
+
+验收在 `tests/test_auth.py`：`test_docs_are_not_mounted_when_auth_is_required`
+（断言三个 url 为 `None` 且请求 401）与 `test_docs_are_served_in_local_dev`。
 
 ---
 
@@ -315,7 +339,8 @@ nginx 上对应的是 `proxy_next_upstream` 之类的重试策略：本服务是
 - [ ] `journalctl -u smart-dispatcher` 能看到启动那行 `smart-dispatcher 启动：{...}`，
       其中 `state_backend` 是 `SqliteStateStore`（不是 `InMemoryStateStore`），
       且**没有** `DISPATCHER_AUTH_TOKEN 未配置` 与那条「状态后端是 memory」的 ERROR
-- [ ] 反代侧限制请求体大小与 `/docs`、`/openapi.json` 的暴露面
+- [ ] 反代侧限制请求体大小（`/docs`、`/openapi.json` 在生产形态下已不挂载，
+      不需要再单独挡——见第 4 节）
 - [ ] 已和 PM 确认第 9 节的决策项
 
 ---

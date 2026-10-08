@@ -169,12 +169,33 @@ def create_app(*, auth: AuthConfig | None = None) -> FastAPI:
                 "生产部署必须配置该变量（见 .env.example）。"
             )
 
+    # 交互式文档（/docs、/redoc）与运行时 /openapi.json 的开关**跟着鉴权走**，
+    # 不另设环境变量。理由是这两件事本来就是同一件：**开了主令牌就是生产形态**
+    # （create_app 在未配令牌时打 ERROR 日志，lifespan 也拿它判断"像不像生产"），
+    # 而生产不想要一个把全部 API 面（端点、参数、错误码）摊给公网扫描器的页面。
+    #
+    # 为什么不给"生产也开文档"的开关：一个能重新打开文档的配置项，就是一条
+    # "配错一行就把 API 面重新暴露出去"的路。契约（openapi.yaml）仍然是完整的，
+    # 需要时读它、或在本机（无令牌）起服务看 /docs——**关的是可交互浏览，不是声明**。
+    #
+    # 结构上把路由去掉（而不是只靠中间件拦成 401）：中间件拦不拦得住取决于
+    # PUBLIC_PATHS 那张表，将来若有人把 /docs 加进"公开路径"，文档会当场裸露；
+    # 路由压根不存在，就没有这个面。审计项「/docs、/openapi.json 公网无鉴权可达」。
+    docs_url = None if auth.required else "/docs"
     app = FastAPI(
         title="Smart 调度层",
         version="0.2.0",
         summary="评估 → 路由 → 拆解并行执行 → 自进化",
         lifespan=lifespan,
+        docs_url=docs_url,
+        redoc_url=None if auth.required else "/redoc",
+        openapi_url=None if auth.required else "/openapi.json",
     )
+    if auth.required:
+        # 不静默：这是"文档为什么打不开"唯一能自己浮出水面的地方。
+        log.info("已配置主令牌（生产形态）：/docs、/redoc、/openapi.json 不再挂载")
+    else:
+        log.info("未配置主令牌（本地开发）：/docs 可用；生产请配 DISPATCHER_AUTH_TOKEN")
     # 已发放令牌的登记簿。按 app 实例建（不是进程级单例），与 sse_limiter 同口径：
     # 测试里会构造多个 app，单例会让用例之间互相串味。中间件要它来认已发放令牌，
     # 端点要它来签发/撤销，因此两个都拿同一个引用。

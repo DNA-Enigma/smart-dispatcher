@@ -230,12 +230,31 @@ async def test_no_route_is_reachable_without_a_token(fake):
             assert resp.status_code == 401, f"{path} 未受鉴权保护：{resp.status_code}"
 
 
-async def test_docs_and_openapi_are_protected(fake):
-    """文档端点是自省面，会暴露路由/价格/限额，与 ``/v1/policy`` 同级。"""
-    async with _client(create_app(auth=AUTH)) as c:
+async def test_docs_are_not_mounted_when_auth_is_required(fake):
+    """生产形态（配了主令牌）下，交互式文档**结构上就不存在**。
+
+    只拦成 401 是不够的：拦不拦得住取决于 ``PUBLIC_PATHS`` 那张表，将来若有人把
+    ``/docs`` 加进「公开路径」，文档会当场裸露给公网扫描器。这里断言的是路由压根
+    没挂（``docs_url`` / ``redoc_url`` / ``openapi_url`` 全为 ``None``）。
+    请求仍回 401——中间件早于路由，对没令牌的人，``/docs`` 和任意陌生路径长得一样。
+    """
+    app = create_app(auth=AUTH)
+    assert app.docs_url is None and app.redoc_url is None and app.openapi_url is None
+    async with _client(app) as c:
         for path in ("/docs", "/openapi.json", "/redoc"):
-            resp = await c.get(path)
-            assert resp.status_code == 401, f"{path} 未受保护"
+            assert (await c.get(path)).status_code == 401, path
+
+
+async def test_docs_are_served_in_local_dev(fake):
+    """本地开发（未配令牌）要能直接在浏览器里打开 ``/docs``。
+
+    审计表那个决策点的矛盾（开着 = 暴露 API 面；加 token = 浏览器打不开）来自
+    「文档开关」与「是否生产」被当成两件事。这里让两者绑在同一根线上：**配了主令牌
+    就是生产，文档随之下线；没配就是本地，文档可用**——不需要第三个环境变量。
+    """
+    async with _client(create_app()) as c:
+        for path in ("/docs", "/openapi.json", "/redoc"):
+            assert (await c.get(path)).status_code == 200, path
 
 
 async def test_policy_mutation_endpoints_need_a_token(fake):
