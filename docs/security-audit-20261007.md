@@ -204,8 +204,10 @@
 | 413 复用 `media_too_large`（title 只提 Media） | ⚠️ 接受偏差 | 新增 `payload_too_large` 属契约变更（problem.json 封闭词表 + ERROR_TABLE + openapi + 客户端跟升），本轮不扩；功能正确（413 + Problem 体） |
 | 媒体 `retain_days=0`「任务结束即删」语义缩水到 1 天 | ⚠️ 接受 | store 无从判断任务何时结束；已写进 app.py / ports/media.py / .env.example。真做要在终态那一跳删图，会打断「任务跑完再取一眼图」——conformance checklist:257 仍空着，挂账 |
 | 保护集 `_media_refs` 是进程内 dict | ⚠️ 接受单进程假设 | 当前 `InMemoryMediaStore` + 单进程成立；换 Postgres/S3 时必须把「引用」下沉为存储层 pin 表 |
-| `node.name` 与 `output_schema` 仍进 system | ⬜ 未做 | be3 遗留，同类问题、审计未点名，改它要动 planner/researcher 模板 |
-| `_reviewer_system` / `_arbiter_system` 返回未 fill 的模板 | ⬜ 未做 | be3 发现，方向与注入相反（该注入的没注入） |
+| `node.name` 与 `output_schema` 仍进 system | ✅ 已修 | `5132cb7`（`output_schema_ref` 成员校验：执行期兜底 + 计划期 `plan.py:252` 拒绝）+ `ff5ed7f`（`node.name` 出 system，目标改从 user 数据块取，不加字符集约束）。每条反例红绿：改回旧写法 → 注入串命中 system |
+| `_reviewer_system` / `_arbiter_system` 返回未 fill 的模板 | ✅ 已修 | `56e6fa2` — 补 `fill`，字面 `{{tool_whitelist}}`/`{{output_schema}}` 不再进模型。反例：摘掉 fill → 测试红并逐个列出未替换占位符 |
+| `guard_system()` 死代码（零调用点，docs 三处替它背书） | ✅ 已修 | `b081c91` — **删除**（非接上）。它来自 ai-workmate 的"拼产品身份+防注入前言"变换，本仓职责无此位置；docstring 声称的事它做不到（恒等函数），且按它接上会打断 `handler.py:448` 合法自建 system 的路径。承诺改由**会失败的测试**承担 |
+| 商户缓存无界增长 | ✅ 已修 | `7b00704` — 两头 LRU 上界（槽位淘汰 + 单表上限），产出从缓存解耦。反例三条各自验红 |
 | 无发放 token 端点（P2-7）、错误 detail 为空（P2-8） | ⬜ 未做 | 契约既有缺口 |
 | `usage.period/group_by`、`tasks.status/cursor` 契约声明未实现 | ⬜ 未做 | 既有缺口 |
 | `per_user_daily` / `per_tenant_daily` 声明但全仓无引用 | ⬜ 未做 | 日额度形同虚设 |
