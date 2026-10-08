@@ -48,6 +48,16 @@ _AGENT_CONTRACT = """
 可用工具只有：{tools}
 """
 
+# 复核者 / 仲裁者的输出结构。**没有 schema 文件，读的键就是契约本身**——
+# 所以这两串写在读它们的代码旁边（``_verify`` 读 ``verdict``，仲裁读 ``decision``），
+# 而不是散在模板里。模板里那句"你的产出必须满足的结构"以前填不进来，模型看到的是
+# 字面的 ``{{output_schema}}``，等于这一格从来没生效过。
+_VERIFIER_OUTPUT = (
+    '{"verdict": "ok | differ | undecidable", "reason": "一句话结论", '
+    '"fields": [{"field": "有分歧的字段", "primary": "…", "yours": "…"}]}'
+)
+_ARBITER_OUTPUT = '{"decision": "采纳的结论（或 undecidable）", "reason": "裁决依据"}'
+
 
 class NodeExecutor:
     """把 ``NodeExecutorFn`` 协议实现出来。
@@ -370,7 +380,7 @@ class NodeExecutor:
         async def one(idx: int) -> dict | None:
             try:
                 raw, _ = await ctx.llm_json(
-                    [_sys(self._reviewer_system(reviewer_role)), _user(question)],
+                    [_sys(self._reviewer_system(reviewer_role, node)), _user(question)],
                     requires=("text",),
                     max_repair_attempts=0,
                     timeout_ms=node.timeout_ms,
@@ -391,7 +401,7 @@ class NodeExecutor:
             try:
                 arb_raw, _ = await ctx.llm_json(
                     [
-                        _sys(self._arbiter_system(arbiter_role)),
+                        _sys(self._arbiter_system(arbiter_role, node)),
                         _user(data_block("各复核者的意见", json.dumps(verdicts, ensure_ascii=False))),
                     ],
                     requires=("text", "reasoning.strong"),
@@ -427,18 +437,39 @@ class NodeExecutor:
                 return ToolResult.fail("verification_undecidable", "复核无法裁决", retryable=False)
         return primary
 
-    def _reviewer_system(self, role_id: str | None) -> str:
+    def _reviewer_system(self, role_id: str | None, node: Any) -> str:
         name = f"agents/{role_id}.md" if role_id else "agents/verifier.md"
         try:
-            return self._prompts.get(name)
+            raw = self._prompts.get(name)
         except Exception:
-            return self._prompts.get("agents/verifier.md")
+            raw = self._prompts.get("agents/verifier.md")
+        return fill(raw, self._review_fill(role_id, node, _VERIFIER_OUTPUT))
 
-    def _arbiter_system(self, role_id: str) -> str:
+    def _arbiter_system(self, role_id: str, node: Any) -> str:
         try:
-            return self._prompts.get(f"agents/{role_id}.md")
+            raw = self._prompts.get(f"agents/{role_id}.md")
         except Exception:
-            return self._prompts.get("agents/arbiter.md")
+            raw = self._prompts.get("agents/arbiter.md")
+        return fill(raw, self._review_fill(role_id, node, _ARBITER_OUTPUT))
+
+    def _review_fill(self, role_id: str | None, node: Any, output_schema: str) -> dict[str, str]:
+        """复核/仲裁者的模板变量。
+
+        **这两条路以前根本不调用 ``fill``**，模板里的 ``{{tool_whitelist}}`` /
+        ``{{output_schema}}`` 就那么原样进了 system——模型看到的是字面的花括号，
+        而本仓 ``fill`` 的严格性（缺变量即报错）正是为了防这个。方向与注入相反，
+        但同样是"提示词与实现说的不是一回事"。
+
+        工具名单同主路径一样从**人写的配置**推：角色 ``allowed_tools`` ∩ 该 handler
+        声明的工具。verifier / arbiter 在 ``agents.yaml`` 里都是 ``allowed_tools: []``，
+        而 ``_verify`` 也确实只发一次补全、没有工具循环——所以这里算出「无」是实情，
+        不是保守。将来谁给复核角色加了工具，这一格自动跟着变。
+        """
+        role = self._agents.role(role_id) if role_id else None
+        allowed = set(role.allowed_tools) if role else set()
+        allowed &= set(self._registry.tool_names(node.handler))
+        tools_line = ", ".join(sorted(allowed)) or "（无）"
+        return {"tools": tools_line, "tool_whitelist": tools_line, "output_schema": output_schema}
 
 
 # ---------------------------------------------------------------------------

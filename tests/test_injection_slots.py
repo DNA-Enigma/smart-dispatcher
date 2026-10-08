@@ -25,6 +25,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from datetime import UTC, datetime
 
@@ -36,7 +37,7 @@ from dispatcher.core.cancel import CancellationToken
 from dispatcher.core.context import DispatchContext, MediaResolver
 from dispatcher.core.eventbus import EventBus
 from dispatcher.core.nodeexec import NodeExecutor
-from dispatcher.core.plan import ExecutionPlan, Node, PlanBudget, validate_plan
+from dispatcher.core.plan import ExecutionPlan, Node, PlanBudget, Verification, validate_plan
 from dispatcher.core.policy import load_policy
 from dispatcher.core.pricing import load_pricing
 from dispatcher.core.prompts import PromptLibrary
@@ -473,6 +474,61 @@ def test_no_prompt_file_embeds_a_data_fence():
         if mark in p.read_text(encoding="utf-8")
     }
     assert not bad, f"提示词文件里嵌了数据围栏，system 会带着它进模型：{bad}"
+
+
+# ---------------------------------------------------------------------------
+# 1e. 复核 / 仲裁者的 system 也要过 fill：不许留未填充的占位符
+# ---------------------------------------------------------------------------
+#: 占位符的**形状**（与 ``prompts._PLACEHOLDER`` 同一条正则）。各提示词文件开头的
+#: 说明里有字面的 ``{{...}}``——那不是占位符（``\w+`` 匹配不到带点的），所以这里
+#: 断形状而不是"有没有花括号"，否则会把说明文字也算成违规。
+_PLACEHOLDER_SHAPE = re.compile(r"\{\{\w+\}\}")
+
+
+async def test_reviewer_and_arbiter_system_slots_are_filled():
+    """``_reviewer_system`` / ``_arbiter_system`` 以前不调用 ``fill``。
+
+    后果是 verifier / arbiter 的 system 里留着字面的 ``{{tool_whitelist}}`` /
+    ``{{output_schema}}``——与本仓「``fill`` 严格、缺变量即报错」的声明相反，
+    方向与注入相反，但同样是"提示词与实现说的不是一回事"：模型看到的是一个占位符，
+    而不是它该产出的结构。
+
+    这条不只断言"没有占位符"，还断言**填进去的是执行器真正读的键**
+    （``_verify`` 读 ``verdict``，仲裁读 ``decision``）——否则删掉占位符、
+    填一段无关文字也能让上面那条变绿。
+    """
+    llm = ScriptedLLM([
+        {"final": {"merchant": "某店", "category": "餐饮"}},   # 主执行者
+        {"verdict": "ok", "reason": "一致"},                   # 复核者 1
+        {"verdict": "differ", "reason": "金额不同"},            # 复核者 2 → 分歧，触发仲裁
+        {"decision": "采纳", "reason": "以多数为准"},           # 仲裁者
+    ])
+    node = Node(
+        subtask_id="normalize", handler="bookkeeping", executor="agent",
+        role="merchant_classifier", tool_whitelist=["lookup_merchant"], max_rounds=1,
+        verification=Verification(
+            mode="independent_review", reviewers=2,
+            reviewer_role="verifier", arbiter_role="arbiter",
+            on_disagreement="arbiter_decides",
+        ),
+    )
+    result = await _executor(llm)(node, attempt=1, tier_override=None,
+                                  scope={"__task_id__": "task_x"})
+    assert result.ok, result.failure
+
+    systems = [c.system_text for c in llm.calls]
+    assert len(systems) >= 4, f"复核路径没跑起来，只看到 {len(systems)} 次调用"
+    for s in systems:
+        assert not _PLACEHOLDER_SHAPE.search(s), (
+            f"system 里留着未填充的占位符：{_PLACEHOLDER_SHAPE.findall(s)}"
+        )
+    reviewers = [s for s in systems if '"verdict"' in s]
+    arbiters = [s for s in systems if '"decision"' in s]
+    assert reviewers, "复核者的 system 里没填进它该产出的 verdict 结构"
+    assert arbiters, "仲裁者的 system 里没填进它该产出的 decision 结构"
+    assert all("（无）" in s for s in reviewers), (
+        "verifier 角色在 agents.yaml 里 allowed_tools 为空，工具名单该算出「无」"
+    )
 
 
 # ---------------------------------------------------------------------------
