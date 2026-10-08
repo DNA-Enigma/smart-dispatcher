@@ -283,3 +283,46 @@ def test_no_orphan_config_keys(repo_root: Path):
     missing = expected - declared
     assert not missing, f"策略缺少实现期望的段落：{sorted(missing)}"
     assert not (declared - expected), f"策略里有实现从不读取的段落：{sorted(declared - expected)}"
+
+
+# ---------------------------------------------------------------------------
+# 死代码不得冒充防线
+# ---------------------------------------------------------------------------
+def test_the_dead_guard_system_noop_is_not_reintroduced(repo_root: Path):
+    """``prompts.guard_system`` 是恒等函数、全仓零调用点，已删。
+
+    它危险的地方不是"没用"而是**名字**：``docs/`` 里三处把它写成"系统提示词槽位由
+    ``guard_system()`` 独占"，读文档的人会以为 system 槽有一道运行时守卫。它做不到——
+    参数是**渲染完的字符串**，函数无从知道这段文本来自 ``prompts/`` 下的文件还是
+    调用方现拼的，所以它只能 ``return prompt``。一个恒等的"守卫"比没有更糟：它会让
+    后来的人以为这条已经有人管了。
+
+    ``ai-workmate`` 里那个同名函数做的是另一件事（拼产品身份 + 防注入前言的**变换**），
+    本仓没有对应的需求——反注入条款写在各提示词文件自己头上。
+
+    真正的防线在别处，而且是**可失败**的：``fill`` 的严格性，加上
+    ``tests/test_injection_slots.py`` 逐站点钉住的分槽断言（含"任何 system 槽都不得
+    带数据围栏"）。这条测试钉住的是"别把一个恒等函数搬回来充数"。
+
+    用 AST 而不是 grep：本文件的说明文字里就写着这个名字，而注释与文档字符串不算
+    引用（与上面几条同一条纪律）。
+    """
+    offenders: list[str] = []
+    roots = [repo_root / "dispatcher", repo_root / "handlers"]
+    for root in roots:
+        for p in sorted(root.rglob("*.py")):
+            tree = ast.parse(p.read_text(encoding="utf-8"), filename=str(p))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Name) and node.id == "guard_system":
+                    offenders.append(f"{p}:{node.lineno} 引用了 guard_system")
+                elif isinstance(node, ast.Attribute) and node.attr == "guard_system":
+                    offenders.append(f"{p}:{node.lineno} 引用了 guard_system")
+                elif (
+                    isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                    and node.name == "guard_system"
+                ):
+                    offenders.append(f"{p}:{node.lineno} 又定义了 guard_system")
+    assert not offenders, (
+        "guard_system 又出现了。它是恒等函数，提供不了它名字暗示的那道守卫——"
+        f"要守 system 槽就写在 test_injection_slots.py 的分槽测试里：{offenders}"
+    )

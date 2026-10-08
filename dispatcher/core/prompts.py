@@ -107,11 +107,6 @@ def data_block(label: str, content: str) -> str:
     )
 
 
-def guard_system(prompt: str) -> str:
-    """系统槽位。只接受本模块加载的提示词文件内容，调用方无从写入。"""
-    return prompt
-
-
 # ---------------------------------------------------------------------------
 # 策略菜单
 # ---------------------------------------------------------------------------
@@ -219,7 +214,7 @@ def pricing_bucket_guide(pricing_block: str) -> str:
 
 
 __all__ = [
-    "PromptLibrary", "capability_catalog", "data_block", "fill", "guard_system",
+    "PromptLibrary", "capability_catalog", "data_block", "fill",
     "hard_constraints", "policy_menu", "pricing_bucket_guide", "request_block",
     "taxonomy_block",
 ]

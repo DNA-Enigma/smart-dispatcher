@@ -124,7 +124,9 @@ handler 只实现"一次 `execute_tool` 调用该做的工作"。
 ### 8. 提示注入围栏
 
 handler 返回的数据在进入 LLM 提示词时经 `data_block()` 包裹；
-系统提示词槽位由 `guard_system()` 独占。见 [05-media.md](05-media.md)。
+系统提示词槽位由调度层用 `fill()` 从 `prompts/` 下的版本化提示词文件构造
+（占位符缺值即报错，不会把花括号留给模型），且**数据只以 `data_block` 进 user**。
+见 [05-media.md](05-media.md)。
 
 ---
 

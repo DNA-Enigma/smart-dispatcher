@@ -179,7 +179,7 @@ if profile.task_type == "bookkeeping.capture_from_receipt":
 | `ai-workmate/server/app/services/usage_service.py` | 原子 `INSERT ... ON CONFLICT DO UPDATE` 预留 + 汇总 → `BudgetLedger` |
 | `ai-workmate/server/app/services/scheduler_lock.py` | `pg_advisory_lock` → 04 分析任务的单实例保证 |
 | `ai-workmate/server/app/services/report_time.py` | 按用户时区的日 / 周窗口 → 04 分析窗口与用户侧"今天"语义 |
-| `ai-workmate/server/app/services/ai_service.py` | `guard_system()` + `data_block()` 注入防御；多模态调用 |
+| `ai-workmate/server/app/services/ai_service.py` | `data_block()` 注入围栏；多模态调用（`guard_system()` **未移植**：它在那里是"拼产品身份 + 防注入前言"的变换，本仓的反注入条款写在各提示词文件自己头上，见 05-media.md） |
 | `ai-workmate/app/lib/data/task_repo.dart` | 任务状态与进度词汇 → `TaskSnapshot` 刻意对齐，Flutter 侧 1:1 映射 |
 | `duowei-ai/backend/app/core/graph.py` | `asyncio.gather` + `Semaphore` 波次并行 → `DagRunner` |
 | `duowei-ai/backend/app/core/llm_client.py` | `QPSLimiter` 令牌桶 + 兼容 OpenAI 的 stream / non-stream + `llm_generate_json()` → `LLMPort` 参考适配 |

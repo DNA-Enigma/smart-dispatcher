@@ -333,6 +333,149 @@ def test_template_schema_refs_are_all_registered(registry):
 
 
 # ---------------------------------------------------------------------------
+# 1d. 全站点体检：任何 system 槽都不得带数据围栏
+# ---------------------------------------------------------------------------
+#: ``data_block`` 的两条围栏标记。它们只可能出现在**被当作数据**的内容里，
+#: 所以"system 里出现它"就等于"evidence 走错了槽位"。判定不依赖某个具体值，
+#: 因此对将来新增的证据字段同样有效——这正是 `guard_system` 那个恒等函数
+#: 号称能做、却做不到的事（见 test_invariants 里那条同名回归）。
+FENCE_MARKS = ("以下为数据", "数据结束")
+
+
+def _system_text(messages) -> str:
+    return "\n".join(str(m.content) for m in messages if m.role == "system")
+
+
+def _canary_envelope(text: str):
+    from dispatcher.core.contract import TaskEnvelope
+
+    return TaskEnvelope.model_validate(
+        {"identity": {"user_id": "u_1"}, "input": {"text": text}}
+    )
+
+
+def _min_profile():
+    from dispatcher.core.contract import TaskProfile
+
+    return TaskProfile.model_validate({
+        "task_type": "generic.unknown", "modality": ["text"],
+        "complexity": {"score": 0.0, "reasons": []},
+        "urgency": {"level": "normal"},
+        "recommended_mode": "async", "confidence": 0.0,
+    })
+
+
+def _min_decision(policy, *, route_id: str = "multi_step_analysis", path: str = "decompose"):
+    from dispatcher.core.contract import RouteDecision
+
+    return RouteDecision.model_validate({
+        "policy_version": policy.policy_version, "route_id": route_id, "path": path,
+        "model_tier": "standard", "handler": None, "tool_set": [],
+        "execution_mode": "async", "decompose": True,
+        "budget": {"max_cost": 0.08, "max_wall_ms": 60000, "max_llm_calls": 8},
+        "rationale": "多步。", "confidence": 0.5,
+        "guard": {"applied": [], "fallback_used": False, "violations": []},
+    })
+
+
+def _stage_system_slots(policy, registry, prompts, pricing, taxonomy, llm) -> dict[str, str]:
+    """把每个会写 system 槽的构造点都跑一遍，返回 {名字: system 文本}。
+
+    逐个文件读代码判断"这里只有指令"是不够的——``3b6f41d`` 与 ``bb381b7`` 都是
+    实现与声明相反的例子，而它们单看代码都说得通。**跑一遍**才能发现。
+    """
+    from dispatcher.core.runlog import HumanSignal, RunLog
+    from dispatcher.evolution.analyzer import Analyzer
+    from dispatcher.evolution.detectors import DetectionReport, MetricFinding
+    from dispatcher.stages.decomposer import Decomposer
+    from dispatcher.stages.evaluator import Evaluator
+    from dispatcher.stages.router import Router
+
+    canary = "SENTINEL_FENCE_1a2"
+    env = _canary_envelope(canary)
+    profile = _min_profile()
+    decision = _min_decision(policy)
+    slots: dict[str, str] = {}
+
+    evaluator = Evaluator(
+        policy=policy, pricing=pricing, registry=registry, prompts=prompts, llm=llm,
+        media=InMemoryMediaStore(allowed_mime=["image/png"], max_bytes=1000),
+        taxonomy=taxonomy,
+    )
+    slots["evaluator"] = _system_text(evaluator._build_messages(env, []))
+
+    router = Router(policy=policy, registry=registry, prompts=prompts, llm=llm, pricing=pricing)
+    slots["router"] = _system_text(router._build_messages(env, profile))
+
+    decomposer = Decomposer(
+        policy=policy, registry=registry, agents=load_agents(get_settings().agents_path),
+        prompts=prompts, llm=llm, templates_dir=REPO_ROOT / "config" / "flow_templates",
+    )
+    slots["decomposer"] = _system_text(decomposer._messages(env, profile, decision))
+
+    logs = [
+        RunLog(
+            run_id="run_1", task_id="task_1", user_id="u_1", policy_version="pv_1",
+            started_at=datetime(2026, 10, 7, 12, 0, tzinfo=UTC),
+            human_signal=HumanSignal(
+                verdict="edited", edits=[{"field": canary, "from": "其他", "to": canary}]
+            ),
+        )
+    ]
+    report = DetectionReport(
+        findings=[MetricFinding(
+            detector_id="field_edit_hotspot", metric="field_edit_rate", observed=1.0,
+            threshold=0.15, sample_size=1, window_days=14, severity="medium",
+            suggests=["prompt_patch"], group=canary,
+        )],
+        skipped=[], evaluated=1,
+        window=(datetime(2026, 10, 1, tzinfo=UTC), datetime(2026, 10, 7, tzinfo=UTC)),
+    )
+    analyzer = Analyzer(
+        policy=policy, prompts=prompts, llm=llm,
+        engines_dir=REPO_ROOT / "config" / "evolution",
+    )
+    slots["analyzer"] = _system_text(analyzer._messages(report, logs))
+    return slots
+
+
+def test_no_stage_system_slot_carries_a_data_fence(policy, registry, prompts, pricing, taxonomy):
+    """逐站点：evaluator / router / decomposer / analyzer 的 system 里都没有数据围栏。
+
+    这四条是**读到过"合成没问题"、实际却出过问题**的那一类：``bb381b7`` 之前
+    analyzer 的 system 里就嵌着一整个 data_block。把它们放在一起跑，是为了让
+    "证据走错槽位"这类错误在**任何**一个站点上出现时都能被一条测试抓住，
+    而不是只能靠逐个模块的人去读。
+    """
+    slots = _stage_system_slots(policy, registry, prompts, pricing, taxonomy, ScriptedLLM([]))
+    assert set(slots) == {"evaluator", "router", "decomposer", "analyzer"}
+    for name, system in slots.items():
+        for mark in FENCE_MARKS:
+            assert mark not in system, (
+                f"{name} 的 system 槽里出现了数据围栏标记 {mark!r}——证据走错槽位了"
+            )
+        assert system.strip(), f"{name} 的 system 是空的，那这条检查什么也没证明"
+
+
+def test_no_prompt_file_embeds_a_data_fence():
+    """再补一条静态的：``prompts/`` 下的提示词文件里也不许有围栏。
+
+    动态那几条覆盖的是"运行时把数据拼进 system"的站点；直答（``stages/direct.py``）
+    的 system 就是 ``direct_answer.md`` 本身，没有可注入的变量，所以它只能这样查。
+    将来谁把一段数据块样本粘进提示词文件里当例子，这里会红。
+    """
+    files = sorted((REPO_ROOT / "prompts").rglob("*.md"))
+    assert files, "一份提示词都没读到，这条测试就什么也没证明"
+    bad = {
+        str(p.relative_to(REPO_ROOT)): mark
+        for p in files
+        for mark in FENCE_MARKS
+        if mark in p.read_text(encoding="utf-8")
+    }
+    assert not bad, f"提示词文件里嵌了数据围栏，system 会带着它进模型：{bad}"
+
+
+# ---------------------------------------------------------------------------
 # 2. query_ledger：指令进 system，用户那句话与它产生的数据进 user
 # ---------------------------------------------------------------------------
 async def test_query_ledger_judgment_splits_instructions_from_user_data():
