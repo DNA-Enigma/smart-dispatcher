@@ -212,7 +212,8 @@
 | 错误 detail 为空（P2-8） | ⬜ 未做 | 契约既有缺口（本轮未涉及） |
 | `usage.period/group_by`、`tasks.status/cursor` 契约声明未实现 | ⬜ 未做 | 既有缺口 |
 | `per_user_daily` / `per_tenant_daily` 声明但全仓无引用 | ⬜ 未做 | 日额度形同虚设 |
-| 依赖无 lock 文件（安装不可复现）、CVE 需人工核对 | ⬜ 未做 | **上线前要处理**（审计专家 5 点名） |
+| 依赖无 lock 文件（安装不可复现）、CVE 需人工核对 | 🔄 半修 | `30ea364` — `requirements.lock`（2079 字节，精确版本），已在**全新 venv** 装一遍并跑通 460 测试。**CVE 人工核对仍空着**，上线前补 |
+| 部署就绪检查：状态全在进程内存 | ⬜ 未做 | `ed31b3d` 的 `docs/12-deployment.md` 列了 13 条「重启即丢」：**子令牌全丢→持有者 401**、**策略版本静默回退**、任务快照/事件流/上传媒体全丢。关键：`SqliteStateStore` 已实现且有测试，但 `Settings` 没字段、`.env` 换不了，生产必然跑内存后端；媒体写死 `InMemoryMediaStore`。**放量前必须解决** |
 | `/docs`、`/openapi.json` 公网无鉴权可达 | ⬜ 未做 | be2 遗留决策点之一（配 token 后 `/docs` 浏览器打不开） |
 | `Last-Event-ID`/`since` 超长数字串 `int()` → 稳定 500；`?limit=abc` → 422 非 Problem 体；`sse.replay` SQL 未传 limit | ⬜ 未做 | be4 看到但点名范围外，同类缺陷、改法同为「不可信则退化/夹取」 |
 
